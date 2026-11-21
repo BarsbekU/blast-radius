@@ -102,8 +102,19 @@ def main() -> int:
         state["lines"][phase].setdefault(name[len(SRC):], set()).add(line)
         return mon.DISABLE
 
+    def on_start(code, offset):
+        # Same as the coverage tracer: a call records its def line (a body on
+        # that line emits no LINE event).
+        name = code.co_filename
+        phase = state["phase"]
+        if phase is None or not name.startswith(SRC + "sqlglot/"):
+            return mon.DISABLE
+        state["lines"][phase].setdefault(name[len(SRC):], set()).add(code.co_firstlineno)
+        return mon.DISABLE
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     def set_phase(phase):
         previous = state["phase"]

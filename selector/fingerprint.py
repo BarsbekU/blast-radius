@@ -166,9 +166,46 @@ class Fingerprinter:
         return digest("repr", t.__module__, t.__qualname__, ADDRESS.sub("", repr(v))[:2000])
 
 
+def key_id(key) -> str:
+    """Stable text for a table key. Must match
+    tools/mapbuild/blast_trace.py:key_id (what the tracer recorded)."""
+    if isinstance(key, str):
+        return "s:" + key
+    if isinstance(key, bool) or key is None or isinstance(key, (int, float)):
+        return "r:" + repr(key)
+    if isinstance(key, enum.Enum):
+        return f"e:{type(key).__qualname__}.{key.name}"
+    if isinstance(key, type):
+        return f"t:{key.__module__}.{key.__qualname__}"
+    if isinstance(key, tuple):
+        return "u:(" + "|".join(key_id(k) for k in key) + ")"
+    return "o:" + type(key).__qualname__
+
+
+ELEMENTS: dict = {}  # "mod|Qual|ATTR" -> {key id: fingerprint of the entry}
+TABLES: dict = {}  # "mod|Qual|ATTR" -> the table, for computing ELEMENTS on demand
+
+
+def table_elements(fingerprinter: "Fingerprinter", value) -> dict:
+    """Per-entry fingerprints of a dict/set table, so a change can be
+    narrowed to the entries that differ."""
+    if type(value) is dict:
+        table = {}
+        for k, v in value.items():
+            kid = key_id(k)
+            fp = fingerprinter.value(v)
+            table[kid] = fp if kid not in table else digest(table[kid], fp)
+        return table
+    return {key_id(e): "1" for e in value}
+
+
 def collect(fingerprinter: Fingerprinter) -> dict:
     out: dict = {}
     seen_classes: set = set()
+
+    def elements(key: str, name: str, value) -> None:
+        if name.isupper() and type(value) in (dict, set, frozenset):
+            TABLES[key] = value
 
     def visit_class(cls, module: str) -> None:
         if id(cls) in seen_classes:
@@ -189,6 +226,7 @@ def collect(fingerprinter: Fingerprinter) -> dict:
                 continue
             try:
                 out[f"{module}|{qual}|{name}"] = fingerprinter.value(value)
+                elements(f"{module}|{qual}|{name}", name, value)
             except Exception as error:  # pragma: no cover - be robust
                 out[f"{module}|{qual}|{name}"] = "error:" + type(error).__name__
         # Inherited-from list matters when attributes are added or removed.
@@ -311,24 +349,61 @@ def main() -> int:
     except BaseException as error:  # noqa: BLE001
         json.dump({"ok": False, "error": f"{type(error).__name__}: {str(error)[:500]}"}, sys.stdout)
         return 0
-    fps = collect(Fingerprinter())
+    fingerprinter = Fingerprinter()
+    fps = collect(fingerprinter)
+    callables = function_keys()
     baseline_path = request.get("baseline")
     if not baseline_path:
-        json.dump({"ok": True, "fp": fps, "failed": failed}, sys.stdout)
+        # The baseline needs every table's entries; a comparison only the
+        # changed ones (below).
+        for key, value in TABLES.items():
+            ELEMENTS[key] = table_elements(fingerprinter, value)
+        json.dump({"ok": True, "fp": fps, "failed": failed, "elements": ELEMENTS}, sys.stdout)
         return 0
     with gzip.open(baseline_path, "rt") as handle:
         baseline = json.load(handle)
     base_fp = baseline["fp"]
+    base_elements = baseline.get("elements", {})
     base_failed = {f[0] for f in baseline.get("failed", [])}
     changed = [k for k, v in fps.items() if k in base_fp and base_fp[k] != v]
     added = [k for k in fps if k not in base_fp]
     removed = [k for k in base_fp if k not in fps]
     newly_failed = [f for f in failed if f[0] not in base_failed]
+    # For changed tables: exactly which entries differ (added, removed or
+    # with a different value).
+    entries = {}
+    for k in changed:
+        if k in TABLES:
+            ELEMENTS[k] = table_elements(fingerprinter, TABLES[k])
+        old, new = base_elements.get(k), ELEMENTS.get(k)
+        if old is None or new is None:
+            continue
+        entries[k] = sorted(e for e in set(old) | set(new) if old.get(e) != new.get(e))
     json.dump(
-        {"ok": True, "changed": changed, "added": added, "removed": removed, "failed": newly_failed},
+        {"ok": True, "changed": changed, "added": added, "removed": removed, "failed": newly_failed,
+         "functions": sorted(k for k in changed + added if k in callables), "entries": entries},
         sys.stdout,
     )
     return 0
+
+
+def function_keys() -> set:
+    """Keys whose current value is a function or method (rebinding or new
+    defaults affect the code that calls it, not data readers)."""
+    keys = set()
+    kinds = (types.FunctionType, staticmethod, classmethod, types.MethodType, functools.partial)
+    for modname in [m for m in sys.modules if m.startswith("sqlglot")]:
+        module = sys.modules.get(modname)
+        if module is None:
+            continue
+        for name, value in vars(module).items():
+            if isinstance(value, kinds):
+                keys.add(f"{modname}||{name}")
+            elif isinstance(value, type) and value.__dict__.get("__module__") == modname:
+                for attr, inner in value.__dict__.items():
+                    if isinstance(inner, kinds):
+                        keys.add(f"{modname}|{value.__qualname__}|{attr}")
+    return keys
 
 
 if __name__ == "__main__":

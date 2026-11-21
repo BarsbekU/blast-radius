@@ -241,6 +241,30 @@ class Maps:
         enc = self.attrs.get(key)
         return decode(enc) if enc is not None else 0
 
+    @property
+    def akeys(self) -> dict:
+        if not hasattr(self, "_akeys"):
+            self._akeys = self._load("akeys.json.gz")
+        return self._akeys
+
+    def table_readers(self, key: str, entries) -> int:
+        """Readers of a class attribute; narrowed to the changed entries of a
+        table when the per-key map covers it. A reader with no per-key record
+        for the table (read it in another trace, or only took its length)
+        stays selected."""
+        readers = self.attr_readers(key)
+        table = self.akeys.get(key) if entries else None
+        if not table:
+            return readers
+        keyed = 0
+        for enc in table.values():
+            keyed |= decode(enc)
+        bits = decode(table["*"]) if "*" in table else 0
+        for entry in entries:
+            if entry in table:
+                bits |= decode(table[entry])
+        return bits | (readers & ~keyed)
+
     def attr_readers_named(self, name: str) -> int:
         self.attrs  # noqa: B018 - load
         bits = 0
@@ -658,6 +682,28 @@ class Differ:
         self.broad = False
         self.future_annotations = False
 
+    def dunder_class_stmt(self, stmt, scope: "Scope") -> int:
+        """A class-body assignment to a dunder name (__slots__, __hash__,
+        __match_args__...) changes how instances behave, not data a test
+        reads: the tests that ran the class's methods (importers if none
+        did). Returns the bits; callers OR them in."""
+        if not isinstance(scope.node, ast.ClassDef):
+            return 0
+        targets = []
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            targets = [stmt.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if not any(n.startswith("__") and n.endswith("__") for n in names):
+            return 0
+        bits = self.lines_tests(span(scope.node), ("f",))
+        if not bits:
+            bits = self.shard.importers
+        self.broad = True
+        self.reasons.append(f"class dunder {names[0]} L{stmt.lineno}: users of {scope.node.name}")
+        return bits
+
     def defer(self, scope: "Scope", lines, why: str) -> bool:
         """Leave an import-time change to the fingerprint diff."""
         if not (self.use_fp and scope.import_time):
@@ -681,9 +727,12 @@ class Differ:
             self.reasons.append(f"{why} class L{stmt.lineno}: importers")
             self.broad = True
             return self.shard.importers
-        return self.stmt_tests(stmt, block, index, scope, why)
+        return self.stmt_tests(stmt, block, index, scope, why)  # handles dunders
 
     def added_stmts(self, stmts, block, at: int, scope: "Scope") -> int:
+        dunder = 0
+        for stmt in stmts:
+            dunder |= self.dunder_class_stmt(stmt, scope)
         if self.use_fp and scope.import_time:
             # New methods show up as added fingerprint keys (callers of the
             # name among tests using the class); this is only the fallback.
@@ -691,8 +740,8 @@ class Differ:
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self.fallback |= self.same_name(stmt.name)
             self.defer(scope, [], "inserted")
-            return 0
-        return self.point_tests(block, at - 1, at, scope, "inserted")
+            return dunder
+        return dunder | self.point_tests(block, at - 1, at, scope, "inserted")
 
     # ---- mapping to tests
     def lines_tests(self, lines, kinds) -> int:
@@ -722,12 +771,13 @@ class Differ:
 
     def stmt_tests(self, stmt, block, index: int, scope: Scope, why: str, lines=None) -> int:
         lines = list(lines if lines is not None else span(stmt))
+        dunder = self.dunder_class_stmt(stmt, scope)
         if self.defer(scope, lines, why):
-            return 0
+            return dunder
         if self.shard.executable(lines, scope.kinds):
             self.reasons.append(f"{why} {scope.kind} L{lines[0]}-{lines[-1]}")
-            return self.lines_tests(lines, scope.kinds)
-        return self.point_tests(block, index - 1, index + 1, scope, why + " (no bytecode)")
+            return dunder | self.lines_tests(lines, scope.kinds)
+        return dunder | self.point_tests(block, index - 1, index + 1, scope, why + " (no bytecode)")
 
     # ---- dirtiness
     def old_clean(self, node) -> bool:
@@ -1149,6 +1199,8 @@ class Selector:
         # TPC executor check; any other kind of change disables it.
         self.exec_info = []
         self.exec_ok = True
+        self.fp_only_functions = False
+        self.fp_entries = {}
         bits = 0
         for fp in patches:
             try:
@@ -1176,7 +1228,9 @@ class Selector:
         if not BUDGET.allow(6.0):
             reasons.append("exec check skipped: time budget")
             return bits
-        if self.pending["need"] or any(broad for _, _, broad in self.exec_info):
+        if self.pending["need"] and not getattr(self, "fp_only_functions", False):
+            return bits
+        if any(broad for _, _, broad in self.exec_info):
             return bits
         lines = self.maps.exec_lines
         profile_path = self.maps.root / "exec_profile.json.gz"
@@ -1193,13 +1247,15 @@ class Selector:
             return bits
 
         def run_lines(n):
-            """Changed lines this test executes, per file."""
+            """Changed lines this test executes at run time, per file. (What
+            changed at import time is the fingerprint's business; this check
+            only runs when that was nothing but function rebinding.)"""
             out = {}
             for rel, touched, _ in self.exec_info:
                 shard = self.maps.shard(rel)
                 if shard is None:
                     continue
-                mine = {ln for ln in touched if shard.executors([ln], ("f", "d")) >> n & 1}
+                mine = {ln for ln in touched if shard.executors([ln], ("f",)) >> n & 1}
                 if mine:
                     out[rel] = mine
             return out
@@ -1340,6 +1396,14 @@ class Selector:
                 bits |= self.module_importers(module)
             return bits
         bits = 0
+        self.fp_entries = result.get("entries", {})
+        changed_keys = set(result.get("changed", [])) | set(result.get("added", []))
+        # Only functions rebound or given new defaults/decorators: their
+        # effect flows through calls, which the TPC exec check re-runs.
+        self.fp_only_functions = (
+            not result.get("failed") and not result.get("removed")
+            and bool(changed_keys) and changed_keys <= set(result.get("functions", []))
+        )
         for name, kind, _message in result.get("failed", []):
             bits |= self.module_importers(name)
             reasons.append(f"fingerprint: {name} no longer imports ({kind})")
@@ -1367,8 +1431,11 @@ class Selector:
             if name == "__bases__":
                 return self.module_importers(module)
             if key in self.maps.attrs:
-                # A data attribute: the tests that read it at run time.
-                bits |= self.maps.attr_readers(key)
+                # A data attribute: the tests that read it at run time, or for
+                # a table whose changed entries are known, those that looked
+                # up one of them or used the whole table.
+                entries = getattr(self, "fp_entries", {}).get(key)
+                bits |= self.maps.table_readers(key, entries)
             elif not added:
                 # Never read as data at run time: a method whose defaults or
                 # decorators changed (or an unused constant): its callers.
@@ -1609,6 +1676,7 @@ def main() -> int:
     for patch_path in patches:
         commit = patch_path.stem
         reasons: list = []
+        commit_started = time.monotonic()
         try:
             text = patch_path.read_bytes().decode("utf-8", "replace")
             bits = selector.commit(text, reasons)
@@ -1627,7 +1695,8 @@ def main() -> int:
         cost = (max(sum(ms[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total_cost += cost
         out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
-        log(f"{commit}: {len(chosen)} tests, {len(workers)} workers, {cost/1000:.2f}s | " + "; ".join(reasons[:6]))
+        log(f"{commit}: {len(chosen)} tests, {len(workers)} workers, {cost/1000:.2f}s "
+            f"[{time.monotonic() - commit_started:.2f}s] | " + "; ".join(reasons[:6]))
     out.flush()
     log(f"total simulated {total_cost/1000:.1f}s over {len(patches)} commits, "
         f"{time.monotonic()-STARTED:.2f}s wall")

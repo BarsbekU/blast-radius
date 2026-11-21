@@ -89,6 +89,8 @@ def main() -> int:
     listed: dict = defaultdict(int)
     imported: dict = defaultdict(int)
     attr_readers: dict = defaultdict(int)
+    key_readers: dict = defaultdict(lambda: defaultdict(int))  # "mod|Qual|attr" -> key -> bits
+    keyed_tests: dict = defaultdict(int)  # tests traced with table-key recording
     outcomes: dict = {}
 
     for trace_root in args.traces:
@@ -147,7 +149,12 @@ def main() -> int:
         for module in mods:
             imported[module] |= bit
         for key in attrs:
-            attr_readers[key] |= bit
+            parts = key.split("|", 3)
+            if len(parts) == 4:
+                key_readers["|".join(parts[:3])][parts[3]] |= bit
+                attr_readers["|".join(parts[:3])] |= bit
+            else:
+                attr_readers[key] |= bit
         if number % 200 == 0:
             print(f"loaded test {number}, {len(cov)} keys", flush=True)
 
@@ -211,6 +218,15 @@ def main() -> int:
     if attr_readers:
         with gzip.open(os.path.join(args.out, "attrs.json.gz"), "wt", compresslevel=9) as handle:
             json.dump({k: encode(b) for k, b in sorted(attr_readers.items())}, handle, separators=(",", ":"))
+    if key_readers:
+        # Per table: which tests looked up which key ("*": the whole table).
+        # Only valid for traces made with BLAST_TRACE_KEYS=1; the selector
+        # uses it only when every reader of the table was traced that way.
+        with gzip.open(os.path.join(args.out, "akeys.json.gz"), "wt", compresslevel=9) as handle:
+            json.dump(
+                {tag: {k: encode(b) for k, b in sorted(keys.items())} for tag, keys in sorted(key_readers.items())},
+                handle, separators=(",", ":"),
+            )
     with gzip.open(os.path.join(args.out, "imports.json.gz"), "wt", compresslevel=9) as handle:
         json.dump({m: encode(b) for m, b in sorted(imported.items())}, handle, separators=(",", ":"))
     with open(os.path.join(args.out, "outcomes.json"), "w") as handle:

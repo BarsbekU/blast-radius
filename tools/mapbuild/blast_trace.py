@@ -181,6 +181,24 @@ def _install(out_dir: str) -> None:
     atexit.register(dump)
 
 
+def key_id(key) -> str:
+    """Stable text for a table key, identical across processes. Must match
+    selector/fingerprint.py:key_id."""
+    import enum
+
+    if isinstance(key, str):
+        return "s:" + key
+    if isinstance(key, bool) or key is None or isinstance(key, (int, float)):
+        return "r:" + repr(key)
+    if isinstance(key, enum.Enum):
+        return f"e:{type(key).__qualname__}.{key.name}"
+    if isinstance(key, type):
+        return f"t:{key.__module__}.{key.__qualname__}"
+    if isinstance(key, tuple):
+        return "u:(" + "|".join(key_id(k) for k in key) + ")"
+    return "o:" + type(key).__qualname__
+
+
 def _install_attr_recorder(reads: set) -> None:
     """Record which class-level data attributes of sqlglot classes each test
     reads at run time (not while modules are being imported).
@@ -198,9 +216,17 @@ def _install_attr_recorder(reads: set) -> None:
     import importlib
     import sys
 
+    import weakref
+
     depth = [0]
-    wrapped: set = set()
+    # id -> weakref: ids of garbage-collected classes get reused, so an id
+    # alone would make a new class (say TSQLParser) look already wrapped.
+    wrapped: dict = {}
     module_count = [0]
+
+    def is_wrapped(cls) -> bool:
+        ref = wrapped.get(id(cls))
+        return ref is not None and ref() is cls
 
     class Rec:
         __slots__ = ("value", "key", "hit")
@@ -216,8 +242,161 @@ def _install_attr_recorder(reads: set) -> None:
                 reads.add(self.key)
             return self.value
 
+    # Tables: which keys a test looks up (hits and misses), "*" for anything
+    # that depends on the whole table. Recorded as "module|Qual|attr|key".
+    def note(tag, key):
+        if not depth[0]:
+            try:
+                reads.add(tag + (key_id(key),))
+            except Exception:
+                reads.add(tag + ("*",))
+
+    def note_all(tag):
+        if not depth[0]:
+            reads.add(tag + ("*",))
+
+    class KeyDict(dict):
+        __slots__ = ("_tag",)
+
+        def __getitem__(self, key):
+            note(self._tag, key)
+            return dict.__getitem__(self, key)
+
+        def get(self, key, default=None):
+            note(self._tag, key)
+            return dict.get(self, key, default)
+
+        def __contains__(self, key):
+            note(self._tag, key)
+            return dict.__contains__(self, key)
+
+        def setdefault(self, key, default=None):
+            note(self._tag, key)
+            return dict.setdefault(self, key, default)
+
+        def pop(self, key, *default):
+            note(self._tag, key)
+            return dict.pop(self, key, *default)
+
+        def __setitem__(self, key, value):
+            note(self._tag, key)
+            dict.__setitem__(self, key, value)
+
+        def __delitem__(self, key):
+            note(self._tag, key)
+            dict.__delitem__(self, key)
+
+        def __iter__(self):
+            note_all(self._tag)
+            return dict.__iter__(self)
+
+        def keys(self):
+            note_all(self._tag)
+            return dict.keys(self)
+
+        def values(self):
+            note_all(self._tag)
+            return dict.values(self)
+
+        def items(self):
+            note_all(self._tag)
+            return dict.items(self)
+
+        def copy(self):
+            note_all(self._tag)
+            return dict(dict.items(self))
+
+        def __eq__(self, other):
+            note_all(self._tag)
+            return dict.__eq__(self, other)
+
+        def __ne__(self, other):
+            note_all(self._tag)
+            return dict.__ne__(self, other)
+
+        __hash__ = None
+
+        def __or__(self, other):
+            note_all(self._tag)
+            return dict(dict.items(self)) | other
+
+        def __ror__(self, other):
+            note_all(self._tag)
+            return dict(other) | dict(dict.items(self))
+
+        def __repr__(self):
+            note_all(self._tag)
+            return dict.__repr__(self)
+
+        def __reduce__(self):
+            note_all(self._tag)
+            return (dict, (dict(dict.items(self)),))
+
+        def update(self, *args, **kwargs):
+            note_all(self._tag)
+            dict.update(self, *args, **kwargs)
+
+        def popitem(self):
+            note_all(self._tag)
+            return dict.popitem(self)
+
+        def clear(self):
+            note_all(self._tag)
+            dict.clear(self)
+
+    class KeySet(set):
+        __slots__ = ("_tag",)
+
+        def __contains__(self, key):
+            note(self._tag, key)
+            return set.__contains__(self, key)
+
+        def __iter__(self):
+            note_all(self._tag)
+            return set.__iter__(self)
+
+        def __reduce__(self):
+            note_all(self._tag)
+            return (set, (set(set.__iter__(self)),))
+
+        def __repr__(self):
+            note_all(self._tag)
+            return set.__repr__(self)
+
+    for _name in ("copy", "union", "intersection", "difference", "symmetric_difference",
+                  "issubset", "issuperset", "isdisjoint", "__or__", "__and__", "__sub__",
+                  "__xor__", "__ror__", "__rand__", "__rsub__", "__rxor__", "__eq__", "__ne__",
+                  "__le__", "__lt__", "__ge__", "__gt__", "update", "add", "discard", "remove",
+                  "pop", "clear", "difference_update", "intersection_update",
+                  "symmetric_difference_update", "__ior__", "__iand__", "__isub__", "__ixor__"):
+        def _make(name):
+            base = getattr(set, name)
+
+            def method(self, *args, **kwargs):
+                note_all(self._tag)
+                return base(self, *args, **kwargs)
+
+            method.__name__ = name
+            return method
+
+        setattr(KeySet, _name, _make(_name))
+    KeySet.__hash__ = None
+
+    def tracked_table(value, tag):
+        if type(value) is dict:
+            table = KeyDict(value)
+        elif type(value) is set:
+            table = KeySet(value)
+        else:
+            return value
+        table._tag = tag
+        return table
+
     def wrap(cls) -> None:
-        wrapped.add(id(cls))
+        try:
+            wrapped[id(cls)] = weakref.ref(cls)
+        except TypeError:
+            return
         module = cls.__dict__.get("__module__")
         if not isinstance(module, str) or not module.startswith("sqlglot"):
             return
@@ -229,8 +408,11 @@ def _install_attr_recorder(reads: set) -> None:
                 continue
             if isinstance(value, Rec) or hasattr(type(value), "__get__"):
                 continue
+            key = (module, qual, name)
+            if name.isupper() and os.environ.get("BLAST_TRACE_KEYS") == "1":
+                value = tracked_table(value, key)
             try:
-                type.__setattr__(cls, name, Rec(value, (module, qual, name)))
+                type.__setattr__(cls, name, Rec(value, key))
             except (TypeError, AttributeError):
                 pass
 
@@ -255,7 +437,7 @@ def _install_attr_recorder(reads: set) -> None:
             if id(cls) in seen:
                 continue
             seen.add(id(cls))
-            if id(cls) not in wrapped:
+            if not is_wrapped(cls):
                 wrap(cls)
             try:
                 subs = type.__subclasses__(cls)

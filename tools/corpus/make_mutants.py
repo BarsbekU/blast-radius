@@ -76,13 +76,36 @@ def docstring_lines(source: str) -> set:
     return lines
 
 
-def token_mutation(source: str, rng: random.Random):
+def table_lines(source: str) -> set:
+    """Lines of class-level assignments whose value is a table (dict, set,
+    list, tuple): dialect FUNCTIONS, KEYWORDS, TRANSFORMS, settings..."""
+    import ast
+
+    lines: set = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return lines
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and isinstance(
+                getattr(stmt, "value", None), (ast.Dict, ast.Set, ast.List, ast.Tuple)
+            ):
+                lines.update(range(stmt.lineno, stmt.end_lineno + 1))
+    return lines
+
+
+def token_mutation(source: str, rng: random.Random, only_lines: set | None = None):
     """One token-level edit; returns (new_source, description) or None."""
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return None
     doc = docstring_lines(source)
+    if only_lines is not None:
+        doc = doc | {t.start[0] for t in tokens if t.start[0] not in only_lines}
     lines = source.splitlines(keepends=True)
     candidates = []
     for i, tok in enumerate(tokens):
@@ -256,6 +279,7 @@ def main() -> int:
     parser.add_argument("--count", type=int, default=300)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--prefix", default="m")
+    parser.add_argument("--kinds", default="", help="comma separated kinds to draw from (default: the usual mix)")
     args = parser.parse_args()
     rng = random.Random(args.seed)
 
@@ -282,6 +306,14 @@ def main() -> int:
         if kind == "code":
             rel = pick_py()
             r = token_mutation(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "table":
+            rel = pick_py()
+            source = read(rel)
+            lines = table_lines(source)
+            if not lines:
+                return None
+            r = token_mutation(source, rng, only_lines=lines)
             return [(rel, r)] if r else None
         if kind == "comment":
             rel = pick_py()
@@ -333,6 +365,8 @@ def main() -> int:
         + ["test"] * 5 + ["docstring"] * 3 + ["delete"] * 2 + ["duplicate"] * 1
         + ["swapline"] * 1 + ["docs"] * 1 + ["config"] * 1
     )
+    if args.kinds:
+        kinds_plan = args.kinds.split(",")
     (args.out / "commits").mkdir(parents=True, exist_ok=True)
     kinds: dict = {}
     made = 0
