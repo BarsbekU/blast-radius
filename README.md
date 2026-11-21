@@ -43,7 +43,19 @@ and `python -c` subprocesses the tests start. For each test it records:
 5. Fixtures and other data files select the tests that read them; pytest
    config files select everything only if pytest's settings change or the
    file stops parsing.
-6. The selected tests are packed over 1-8 workers (longest first onto the
+6. A function definition that only moved within a module or class body
+   (identical code, name bound once, no order-sensitive decorators) is not
+   a change; the fingerprint diff still checks the module/class values.
+7. The TPC executor tests (`selector/exec_check.py`): when every changed
+   line they run belongs to the query pipeline, the affected queries'
+   pipeline outputs are recomputed with the patched code. If a few
+   queries' outputs differ, those queries are executed on the TPC-DS data
+   (`maps/data.zip`, loaded exactly as the test does) under two hash seeds
+   and compared with the pristine results.
+8. Optional (`BLAST_PROXY_MAX_NODES=1`): `test_max_nodes` (29 s) is replaced
+   by the same assertions on a 300-wide instead of 10,000-wide statement
+   (`selector/proxy_check.py`) when the patch only edits sqlglot modules.
+9. The selected tests are packed over 1-8 workers (longest first onto the
    least loaded worker) to minimise `slowest worker + 2 s per worker`.
 
 ## Reproducing

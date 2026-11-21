@@ -272,6 +272,214 @@ def line_edit(source: str, rng: random.Random, how: str):
     return "".join(new), f"{how} line {k + 1}"
 
 
+def raw_delete(rel: str, old: str) -> str:
+    lines = old.splitlines(keepends=True)
+    body = "".join(f"-{l}" if l.endswith("\n") else f"-{l}\n\\ No newline at end of file\n" for l in lines)
+    return (
+        f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\nindex 1111111..0000000\n"
+        f"--- a/{rel}\n+++ /dev/null\n@@ -1,{len(lines)} +0,0 @@\n{body}"
+    )
+
+
+def raw_new(rel: str, new: str) -> str:
+    lines = new.splitlines(keepends=True)
+    body = "".join(f"+{l}" for l in lines)
+    return (
+        f"diff --git a/{rel} b/{rel}\nnew file mode 100644\nindex 0000000..1111111\n"
+        f"--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{len(lines)} @@\n{body}"
+    )
+
+
+def raw_rename(old_rel: str, new_rel: str) -> str:
+    return f"diff --git a/{old_rel} b/{new_rel}\nsimilarity index 100%\nrename from {old_rel}\nrename to {new_rel}\n"
+
+
+def _funcs(tree):
+    import ast
+    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def stmt_delete(source: str, rng: random.Random):
+    """Remove one whole simple statement from a function body (body keeps >= 1)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    cands = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list) or len(block) < 2:
+                continue
+            if not isinstance(node, (ast.FunctionDef, ast.If, ast.For, ast.While, ast.With, ast.Try)):
+                continue
+            for s in block:
+                if isinstance(s, (ast.Assign, ast.AugAssign, ast.Expr, ast.Return, ast.If)) and not (
+                    isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                ) and s.end_lineno - s.lineno < 8:
+                    cands.append(s)
+    if not cands:
+        return None
+    s = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    new = lines[: s.lineno - 1] + lines[s.end_lineno:]
+    return "".join(new), f"delete statement lines {s.lineno}-{s.end_lineno}"
+
+
+def name_error(source: str, rng: random.Random):
+    """Misspell one loaded name inside a function body (NameError/AttributeError at run time)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    cands = []
+    for f in _funcs(tree):
+        for n in ast.walk(f):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in ("self", "cls") and len(n.id) > 2:
+                cands.append(n)
+            elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and len(n.attr) > 2:
+                cands.append(n)
+    if not cands:
+        return None
+    n = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    row = n.end_lineno - 1
+    line = lines[row]
+    end = n.end_col_offset
+    # n's text ends at end_col_offset; append a suffix there
+    if end > len(line) or n.lineno != n.end_lineno:
+        return None
+    lines[row] = line[:end] + "_" + line[end:]
+    return "".join(lines), f"misspell name at line {row + 1}"
+
+
+def change_default(source: str, rng: random.Random):
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    cands = []
+    for f in _funcs(tree):
+        for d in list(f.args.defaults) + [d for d in f.args.kw_defaults if d is not None]:
+            if isinstance(d, ast.Constant) and d.lineno == d.end_lineno:
+                cands.append(d)
+    if not cands:
+        return None
+    d = rng.choice(cands)
+    v = d.value
+    if v is True:
+        new = "False"
+    elif v is False:
+        new = "True"
+    elif v is None:
+        new = rng.choice(["0", "''", "False"])
+    elif isinstance(v, int):
+        new = str(v + 1)
+    elif isinstance(v, str):
+        new = repr(v + "x")
+    else:
+        return None
+    lines = source.splitlines(keepends=True)
+    row = d.lineno - 1
+    line = lines[row]
+    lines[row] = line[: d.col_offset] + new + line[d.end_col_offset:]
+    return "".join(lines), f"default -> {new} line {row + 1}"
+
+
+NEW_FUNC = '''
+
+def _unused_helper_{n}(value, default=None):
+    """Return value unless it is None."""
+    return default if value is None else value
+'''
+
+NEW_METHOD = '''
+    def _unused_method_{n}(self, *args):
+        return len(args)
+'''
+
+
+def add_function(source: str, rng: random.Random):
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    n = rng.randrange(1000)
+    classes = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.col_offset == 0]
+    lines = source.splitlines(keepends=True)
+    if classes and rng.random() < 0.6:
+        c = rng.choice(classes)
+        indent = " " * c.body[-1].col_offset
+        if indent != "    ":
+            return None
+        new = lines[: c.end_lineno] + [NEW_METHOD.format(n=n)] + lines[c.end_lineno:]
+        return "".join(new), f"add method to {c.name}"
+    if not source.endswith("\n"):
+        return None
+    return source + NEW_FUNC.format(n=n), "add function at end"
+
+
+def add_import(source: str, rng: random.Random, bad: bool):
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    imports = [s for s in tree.body if isinstance(s, (ast.Import, ast.ImportFrom))]
+    if not imports:
+        return None
+    s = rng.choice(imports)
+    if bad:
+        stmt = rng.choice([
+            "from sqlglot.helpers import ensure_listt\n",
+            "import sqlglot.missing_module\n",
+            "from sqlglot.errors import ParseErorr\n",
+        ])
+    else:
+        stmt = rng.choice(["import itertools\n", "import functools\n", "from collections import OrderedDict\n"])
+    lines = source.splitlines(keepends=True)
+    new = lines[: s.end_lineno] + [stmt] + lines[s.end_lineno:]
+    return "".join(new), f"add import {stmt.strip()}"
+
+
+def swap_methods(source: str, rng: random.Random):
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    pairs = []
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef):
+            b = c.body
+            for a, z in zip(b, b[1:]):
+                if isinstance(a, ast.FunctionDef) and isinstance(z, ast.FunctionDef) and not a.decorator_list and not z.decorator_list:
+                    pairs.append((a, z))
+    if not pairs:
+        return None
+    a, z = rng.choice(pairs)
+    lines = source.splitlines(keepends=True)
+    if a.end_lineno + 1 != z.lineno and not all(not l.strip() for l in lines[a.end_lineno: z.lineno - 1]):
+        return None
+    gap = lines[a.end_lineno: z.lineno - 1]
+    new = lines[: a.lineno - 1] + lines[z.lineno - 1: z.end_lineno] + gap + lines[a.lineno - 1: a.end_lineno] + lines[z.end_lineno:]
+    return "".join(new), f"swap methods {a.name}/{z.name}"
+
+
+def whitespace_edit(source: str, rng: random.Random):
+    lines = source.splitlines(keepends=True)
+    blanks = [i for i, l in enumerate(lines) if not l.strip()]
+    if blanks and rng.random() < 0.5:
+        k = rng.choice(blanks)
+        return "".join(lines[:k] + lines[k + 1:]), f"remove blank line {k + 1}"
+    k = rng.randrange(1, len(lines))
+    return "".join(lines[:k] + ["\n"] + lines[k:]), f"insert blank line {k + 1}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--src", type=Path, required=True)
@@ -358,6 +566,62 @@ def main() -> int:
             k = rng.randrange(len(lines))
             lines.insert(k, "# maintained by the release script\n")
             return [(rel, ("".join(lines), "config comment"))]
+        if kind == "stmtdel":
+            rel = pick_py()
+            r = stmt_delete(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "nameerr":
+            rel = pick_py()
+            r = name_error(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "default":
+            rel = pick_py()
+            r = change_default(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "addfunc":
+            rel = pick_py()
+            r = add_function(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind in ("addimport", "badimport"):
+            rel = pick_py()
+            r = add_import(read(rel), rng, bad=kind == "badimport")
+            return [(rel, r)] if r else None
+        if kind == "swapmethods":
+            rel = pick_py()
+            r = swap_methods(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "whitespace":
+            rel = pick_py()
+            r = whitespace_edit(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "testhelper":
+            rel = rng.choice(["tests/helpers.py", "tests/dialects/test_dialect.py", "tests/test_executor.py", "tests/test_optimizer.py"])
+            r = rng.choice([token_mutation, stmt_delete, name_error])(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "newmodule":
+            pkg = rng.choice(["sqlglot", "sqlglot/dialects", "sqlglot/optimizer", "sqlglot/parsers", "sqlglot/generators", "tests"])
+            name = rng.choice(["extra_utils", "newdialect", "compat", "test_extra"]) + ".py"
+            rel = f"{pkg}/{name}"
+            if (src / rel).exists():
+                return None
+            body = "from __future__ import annotations\n\n\ndef helper(x):\n    return x\n"
+            if pkg == "tests":
+                body = "import unittest\n\n\nclass TestExtra(unittest.TestCase):\n    def test_extra(self):\n        self.assertTrue(True)\n"
+            return [("__raw__", (raw_new(rel, body), f"new file {rel}"))]
+        if kind == "delmodule":
+            rel = rng.choice(py_files + fixtures[:40])
+            return [("__raw__", (raw_delete(rel, read(rel)), f"delete {rel}"))]
+        if kind == "rename":
+            rel = pick_py()
+            new_rel = rel[:-3] + "_impl.py"
+            return [("__raw__", (raw_rename(rel, new_rel), f"rename {rel} -> {new_rel}"))]
+        if kind == "nonpy":
+            rel = rng.choice(["setup.py", "Makefile", "MANIFEST.in", "sqlglotc/setup.py", "sqlglotc/pyproject.toml", "AGENTS.md", "tests/gen_fixtures.py", "tests/leakcheck.py"])
+            text = read(rel)
+            lines = text.splitlines(keepends=True)
+            k = rng.randrange(len(lines) + 1)
+            ins = "# note\n" if not rel.endswith(".md") else "Note.\n"
+            return [(rel, ("".join(lines[:k] + [ins] + lines[k:]), f"insert line {k + 1}"))]
         raise ValueError(kind)
 
     kinds_plan = (
@@ -383,6 +647,10 @@ def main() -> int:
         patch = ""
         desc = []
         for rel, (new, what) in edits:
+            if rel == "__raw__":
+                patch += new
+                desc.append(what)
+                continue
             old = read(rel)
             if new == old:
                 patch = ""

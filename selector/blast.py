@@ -68,6 +68,17 @@ EXEC_TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",
 }
 OPTIMIZED_TPCH = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+# When only a few tpcds queries' pipeline outputs change, run those queries
+# on the TPC-DS data (maps/data.zip) with the patched package and compare with
+# the pristine results; equal results under two hash seeds drop the test.
+RERUN = os.environ.get("BLAST_RERUN", "1") == "1"
+RERUN_MAX_QUERIES = int(os.environ.get("BLAST_RERUN_MAX_QUERIES", "4"))
+RERUN_MAX_SECS = float(os.environ.get("BLAST_RERUN_MAX_SECS", "4"))
+RERUN_EXTRA_SEEDS = [12345]
+# Opt-in (80/20 candidate): scaled-down proxy for the 28.8 s test_max_nodes.
+PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "0") == "1"
+PROXY_SCRIPT = HERE / "proxy_check.py"
+MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "0"))  # 0: derive from batch size
@@ -820,6 +831,7 @@ class Differ:
 
     # ---- walking
     def block(self, old_block, new_block, scope: Scope) -> None:
+        movable = self.movable_defs(old_block, new_block, scope)
         for oi, oj, ni, nj in self.pair_block(old_block, new_block):
             old_seg = old_block[oi:oj]
             new_seg = new_block[ni:nj]
@@ -831,26 +843,97 @@ class Differ:
                 continue
             keys_old = [ast.dump(s) for s in old_seg]
             keys_new = [ast.dump(s) for s in new_seg]
+            # Function definitions moved within a module/class body: same
+            # code, same name, only position differs.
+            old_pos = list(range(len(old_seg)))
+            new_pos = list(range(len(new_seg)))
+            moved = None
+            if movable:
+                mo = {k for k, key in enumerate(keys_old) if key in movable}
+                mn = {k for k, key in enumerate(keys_new) if key in movable}
+                if mo or mn:
+                    moved = (mo, mn)
+                    self.need_fp = True  # module/class values still get compared
+                    for k in mo:
+                        self.reasons.append(f"moved def {old_seg[k].name} L{old_seg[k].lineno}: same code")
+            if moved:
+                old_pos = [k for k in old_pos if k not in moved[0]]
+                new_pos = [k for k in new_pos if k not in moved[1]]
+                keys_old = [keys_old[k] for k in old_pos]
+                keys_new = [keys_new[k] for k in new_pos]
             matcher = difflib.SequenceMatcher(None, keys_old, keys_new, autojunk=False)
             for op, a1, a2, b1, b2 in matcher.get_opcodes():
                 if op == "equal":
                     continue
                 if op == "replace" and a2 - a1 == b2 - b1:
                     for k in range(a2 - a1):
-                        a, b = old_seg[a1 + k], new_seg[b1 + k]
+                        ka, kb = old_pos[a1 + k], new_pos[b1 + k]
+                        a, b = old_seg[ka], new_seg[kb]
                         if type(a) is type(b):
-                            self.stmt(a, b, old_block, oi + a1 + k, scope)
+                            self.stmt(a, b, old_block, oi + ka, scope)
                         else:
-                            self.tests |= self.removed_stmt(a, old_block, oi + a1 + k, scope, "replaced")
-                            self.tests |= self.added_stmts([b], old_block, oi + a1 + k, scope)
+                            self.tests |= self.removed_stmt(a, old_block, oi + ka, scope, "replaced")
+                            self.tests |= self.added_stmts([b], old_block, oi + ka, scope)
                     continue
                 for k in range(a1, a2):
-                    self.tests |= self.removed_stmt(old_seg[k], old_block, oi + k, scope, "deleted")
+                    self.tests |= self.removed_stmt(old_seg[old_pos[k]], old_block, oi + old_pos[k], scope, "deleted")
                 if b2 > b1:
-                    at = oi + a1
-                    if self.only_docstring_insert(new_seg[b1:b2], at, scope):
+                    at = oi + (old_pos[a1] if a1 < len(old_pos) else len(old_seg))
+                    stmts = [new_seg[new_pos[k]] for k in range(b1, b2)]
+                    if self.only_docstring_insert(stmts, at, scope):
                         continue
-                    self.tests |= self.added_stmts(new_seg[b1:b2], old_block, at, scope)
+                    self.tests |= self.added_stmts(stmts, old_block, at, scope)
+
+    SAFE_DECORATORS = {"property", "staticmethod", "classmethod", "cached_property", "abstractmethod"}
+
+    def movable_defs(self, old_block, new_block, scope) -> set:
+        """ast.dump keys of function definitions that may have moved within
+        this import-time block without changing: identical AST occurring
+        exactly once in each block, a name bound exactly once in each, and
+        no decorators beyond the built-in descriptors (a registering
+        decorator could depend on order). Where one actually moved, the
+        fingerprint diff still compares the module/class values."""
+        if not scope.import_time or not self.use_fp:
+            return set()
+
+        def bound_names(block):
+            names: dict = {}
+            for s in block:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names[s.name] = names.get(s.name, 0) + 1
+                else:
+                    for node in ast.walk(s):
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                            names[node.id] = names.get(node.id, 0) + 1
+                        elif isinstance(node, ast.alias):
+                            n = (node.asname or node.name).split(".")[0]
+                            names[n] = names.get(n, 0) + 1
+            return names
+
+        def safe(fn):
+            for d in fn.decorator_list:
+                name = d.id if isinstance(d, ast.Name) else d.attr if isinstance(d, ast.Attribute) else None
+                if name not in self.SAFE_DECORATORS:
+                    return False
+            return True
+
+        def defs(block):
+            out: dict = {}
+            for s in block:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.setdefault(ast.dump(s), []).append(s)
+            return out
+
+        old_defs, new_defs = defs(old_block), defs(new_block)
+        names_old, names_new = bound_names(old_block), bound_names(new_block)
+        keys = set()
+        for key, items in old_defs.items():
+            if len(items) != 1 or len(new_defs.get(key, [])) != 1:
+                continue
+            fn = items[0]
+            if safe(fn) and names_old.get(fn.name) == 1 and names_new.get(fn.name) == 1:
+                keys.add(key)
+        return keys
 
     def only_docstring_insert(self, stmts, at: int, scope: Scope) -> bool:
         return at == 0 and len(stmts) == 1 and is_docstring(stmts[0]) and not isinstance(
@@ -1217,9 +1300,47 @@ class Selector:
         except Exception as error:
             reasons.append(f"exec check failed ({error!r}); keeping all")
         try:
+            bits = self.proxy_refine(bits, reasons)
+        except Exception as error:
+            reasons.append(f"proxy check failed ({error!r}); keeping all")
+        try:
             bits = self.verify_heavy(bits, self.ms, reasons)
         except Exception as error:
             reasons.append(f"verify failed ({error!r}); keeping all")
+        return bits
+
+    def proxy_refine(self, bits: int, reasons: list) -> int:
+        """Opt-in: replace test_max_nodes by a scaled-down run of its body
+        (selector/proxy_check.py) when the commit only edits sqlglot modules
+        in place and they all still compile."""
+        n = self.number_of.get(MAX_NODES_TEST)
+        if not (PROXY_MAX_NODES and n is not None and bits >> n & 1 and self.exec_ok and self.changes is not None):
+            return bits
+        if not PROXY_SCRIPT.exists() or not (PRISTINE / "sqlglot").is_dir():
+            return bits
+        if not BUDGET.allow(3.0):
+            reasons.append("proxy check skipped: time budget")
+            return bits
+        request = {"root": str(PRISTINE), "overrides": self.pending["overrides"], "deleted": self.pending["deleted"]}
+        env = {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-P", "-s", str(PROXY_SCRIPT)],
+                input=json.dumps(request), capture_output=True, text=True, timeout=20, env=env,
+            )
+            result = json.loads(proc.stdout)
+        except Exception as error:
+            reasons.append(f"proxy check unavailable ({error!r})")
+            return bits
+        if result.get("ok") and result.get("passed"):
+            reasons.append("proxy: scaled test_max_nodes passed -> dropped")
+            return bits & ~(1 << n)
+        reasons.append(f"proxy: scaled test_max_nodes failed ({(result.get('error') or '')[:80]}) -> kept")
         return bits
 
     def exec_refine(self, bits: int, reasons: list) -> int:
@@ -1296,6 +1417,21 @@ class Selector:
             "queries": queries,
             "optimized_tpch": opt_ok,
         }
+        data_zip = self.maps.root / "data.zip"
+        costs_path = self.maps.root / "exec_costs.json"
+        if RERUN and "tpcds" in queries and data_zip.exists() and costs_path.exists() and BUDGET.allow(6.0 + 2 * RERUN_MAX_SECS):
+            request["rerun"] = {"tpcds": {
+                "data": str(data_zip),
+                "prefix": "tests/fixtures/optimizer/tpc-ds/",
+                "costs": json.loads(costs_path.read_text()).get("tpcds", {}),
+                "max_queries": RERUN_MAX_QUERIES,
+                "max_secs": RERUN_MAX_SECS,
+                "extra_seeds": RERUN_EXTRA_SEEDS,
+                "root": str(PRISTINE),
+                "overrides": self.pending["overrides"],
+                "deleted": self.pending["deleted"],
+                "timeout": 30,
+            }}
         env = {
             "PYTHONHASHSEED": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -1316,6 +1452,8 @@ class Selector:
         if not result.get("ok"):
             reasons.append(f"exec check: {result.get('error', '')[:80]}")
             return bits
+        for key, note in (result.get("rerun") or {}).items():
+            reasons.append(f"exec check: {key} re-ran queries {note['tried']}, still different {note['still']}")
         for key, idx in queries.items():
             if not result["changed"].get(key):
                 bits &= ~(1 << targets[key])

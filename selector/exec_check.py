@@ -73,6 +73,8 @@ def step_fingerprint(plan, serde) -> str:
 
 def main() -> int:
     request = json.load(sys.stdin)
+    if request.get("mode") == "rerun_only":
+        return rerun_only(request)
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
     from fingerprint import _Finder  # noqa: E402
@@ -164,19 +166,34 @@ def main() -> int:
             return False
         return True
 
+    rerun = request.get("rerun") or {}
     changed = {"tpch": [], "tpcds": []}
+    rerun_note = {}
     try:
         for test in ("tpch", "tpcds"):
             records = profile[test]
             schema_dict = profile["schemas"][test]
+            cfg = rerun.get(test)
+            limit = cfg["max_queries"] if cfg else 0
             for i in request.get("queries", {}).get(test, []):
                 try:
                     if not same(records[i], schema_dict):
                         changed[test].append(i)
                 except BaseException:  # noqa: BLE001 - an error is a change
                     changed[test].append(i)
-                if changed[test]:
-                    break  # one changed query is enough to keep the test
+                if len(changed[test]) > limit:
+                    break  # too many changed queries to re-run: keep the test
+            costs = cfg.get("costs", {}) if cfg else {}
+            est = sum(costs.get(str(i), 99.0) for i in changed[test])
+            if cfg and changed[test] and len(changed[test]) <= limit and est <= cfg["max_secs"]:
+                # The pipeline output of a few queries changed. Run them for
+                # real with the patched package and compare with the
+                # pristine results (rerun.py); identical result and duckdb
+                # SQL under every seed tried mean the comparison the test
+                # makes is unchanged.
+                still = rerun_queries(cfg, records, changed[test], schema_dict, transpile, h)
+                rerun_note[test] = {"tried": list(changed[test]), "still": still}
+                changed[test] = still
         optimized_changed = False
         if request.get("optimized_tpch"):
             for rec in profile["tpch"]:
@@ -192,7 +209,112 @@ def main() -> int:
     except BaseException as error:  # noqa: BLE001
         json.dump({"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}, sys.stdout)
         return 0
-    json.dump({"ok": True, "changed": changed, "optimized_tpch_changed": optimized_changed}, sys.stdout)
+    json.dump({"ok": True, "changed": changed, "optimized_tpch_changed": optimized_changed,
+               "rerun": rerun_note}, sys.stdout)
+    return 0
+
+
+def load_table(zf, member, columns, Table):
+    """tests/test_executor.py setUpClass's loader, reading from data.zip."""
+    import ast
+    import csv
+    import gzip
+    import io
+
+    with zf.open(member) as raw, gzip.open(io.BytesIO(raw.read()), "rt", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle, delimiter="|")
+        next(reader)
+        rows, ctypes = [], []
+        for row in reader:
+            if not ctypes:
+                for v in row:
+                    try:
+                        ctypes.append(type(ast.literal_eval(v)))
+                    except (ValueError, SyntaxError):
+                        ctypes.append(str)
+            rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return Table(columns=columns, rows=rows)
+
+
+def run_one(sql, schema_dict, zf, prefix, cache):
+    """mp_execute as the test runs it: parse in the parent, pickle to the
+    worker, find_tables there, execute with the schema and loaded tables."""
+    from sqlglot import find_tables, parse_one
+    from sqlglot.executor import execute
+    from sqlglot.executor.table import Table
+
+    expression = pickle.loads(pickle.dumps(parse_one(sql)))
+    tables = {}
+    for t in find_tables(expression):
+        name = t.name
+        if name not in cache:
+            cache[name] = load_table(zf, f"{prefix}{name}.csv.gz", schema_dict[name], Table)
+        tables[name] = cache[name]
+    result = execute(expression, schema=schema_dict, tables=tables)
+    return h([list(result.columns), [[repr(v) for v in row] for row in result.rows]])
+
+
+def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list:
+    """Indices whose result (or duckdb SQL) differs, or that error; checked
+    in this process (PYTHONHASHSEED=0) and again in a child per extra seed."""
+    import zipfile
+
+    still = []
+    with zipfile.ZipFile(cfg["data"]) as zf:
+        cache: dict = {}
+        for i in indices:
+            rec = records[i]
+            try:
+                if not rec.get("execute") or "result" not in rec:
+                    still.append(i)
+                elif hasher(transpile(rec["sql"], write="duckdb")[0]) != rec.get("duck"):
+                    still.append(i)
+                elif run_one(rec["sql"], schema_dict, zf, cfg["prefix"], cache) != rec["result"]:
+                    still.append(i)
+            except BaseException:  # noqa: BLE001 - an error is a change
+                still.append(i)
+    ok = [i for i in indices if i not in still]
+    for seed in cfg.get("extra_seeds", []):
+        if not ok:
+            break
+        import subprocess
+
+        child = {"mode": "rerun_only", "root": cfg["root"], "overrides": cfg["overrides"],
+                 "deleted": cfg["deleted"], "data": cfg["data"], "prefix": cfg["prefix"],
+                 "schema": schema_dict, "queries": [[i, records[i]["sql"], records[i]["result"]] for i in ok]}
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        try:
+            proc = subprocess.run([sys.executable, "-P", "-s", os.path.abspath(__file__)],
+                                  input=json.dumps(child), capture_output=True, text=True,
+                                  timeout=cfg.get("timeout", 30), env=env)
+            bad = json.loads(proc.stdout)["bad"]
+        except Exception:  # noqa: BLE001
+            bad = ok
+        still.extend(i for i in ok if i in bad)
+        ok = [i for i in ok if i not in bad]
+    return sorted(still)
+
+
+def rerun_only(request) -> int:
+    import zipfile
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
+    from fingerprint import _Finder  # noqa: E402
+
+    sys.path.insert(0, request["root"])
+    if request.get("overrides") or request.get("deleted"):
+        sys.meta_path.insert(0, _Finder(request.get("overrides", {}), set(request.get("deleted", []))))
+    bad = []
+    with zipfile.ZipFile(request["data"]) as zf:
+        cache: dict = {}
+        for i, sql, expected in request["queries"]:
+            try:
+                if run_one(sql, request["schema"], zf, request["prefix"], cache) != expected:
+                    bad.append(i)
+            except BaseException:  # noqa: BLE001
+                bad.append(i)
+    json.dump({"bad": bad}, sys.stdout)
     return 0
 
 
