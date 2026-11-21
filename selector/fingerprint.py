@@ -110,14 +110,22 @@ class Fingerprinter:
     def _value(self, v, t, depth: int) -> str:
         val = self.value
         if t in (tuple, list):
-            return digest(t.__name__, *[val(x, depth) for x in v])
+            parts = [val(x, depth) for x in v]
+            if v and all(isinstance(x, type) for x in v):
+                # e.g. tuple({exp.Add, exp.Date, ...}) for isinstance checks:
+                # built from a set of classes, so the order is arbitrary.
+                parts.sort()
+            return digest(t.__name__, *parts)
         if t in (set, frozenset):
             return digest(t.__name__, *sorted(val(x, depth) for x in v))
         if isinstance(v, dict):
+            # Contents, not order: many sqlglot tables are built by iterating
+            # sets of classes, whose order follows memory addresses and so
+            # differs between processes even with a fixed hash seed.
             extra = getattr(v, "default_factory", None)
             return digest(
                 "dict", t.__qualname__, val(extra, depth) if extra is not None else "",
-                *[val(k, depth) + ":" + val(x, depth) for k, x in v.items()],
+                *sorted(val(k, depth) + ":" + val(x, depth) for k, x in v.items()),
             )
         if isinstance(v, enum.Enum):
             return digest("enum", type(v).__module__, type(v).__qualname__, v.name)
@@ -170,10 +178,9 @@ def collect(fingerprinter: Fingerprinter) -> dict:
         for name, value in list(cls.__dict__.items()):
             if name.startswith("__") and name.endswith("__") and name not in ("__slots__",):
                 continue
-            if isinstance(value, types.FunctionType) and "<lambda>" not in value.__qualname__:
-                continue  # methods: line coverage handles their bodies
-            if isinstance(value, (staticmethod, classmethod, property)):
-                continue
+            # Methods are fingerprinted by identity and defaults only (see
+            # Fingerprinter.function): edits inside their bodies are the
+            # line-coverage maps' job, rebinding or new defaults are this one's.
             if isinstance(value, type):
                 inner_module = value.__dict__.get("__module__")
                 if inner_module == module or (isinstance(inner_module, str) and inner_module.startswith("sqlglot")):
@@ -202,8 +209,8 @@ def collect(fingerprinter: Fingerprinter) -> dict:
                 owner = value.__dict__.get("__module__")
                 if owner == modname:
                     visit_class(value, modname)
-                continue
-            if isinstance(value, types.FunctionType) and "<lambda>" not in value.__qualname__:
+                # Which class the name is bound to (identity only).
+                out[f"{modname}||{name}"] = fingerprinter.value(value)
                 continue
             try:
                 out[f"{modname}||{name}"] = fingerprinter.value(value)

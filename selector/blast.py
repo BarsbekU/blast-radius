@@ -32,6 +32,7 @@ import json
 import os
 import posixpath
 import re
+import subprocess
 import sys
 import time
 import tomllib
@@ -39,7 +40,15 @@ import zipfile
 from pathlib import Path
 
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
-MAPS = Path(os.environ.get("BLAST_MAPS", str(Path(__file__).resolve().parent / "maps")))
+HERE = Path(__file__).resolve().parent
+MAPS = Path(os.environ.get("BLAST_MAPS", str(HERE / "maps")))
+# Pristine sqlglot (importable, precompiled) and its attribute fingerprints,
+# both prepared when the image is built (see Dockerfile).
+PRISTINE = Path(os.environ.get("BLAST_PRISTINE", str(HERE / "pristine")))
+FP_BASELINE = Path(os.environ.get("BLAST_FP_BASELINE", str(HERE / "fp_baseline.json.gz")))
+FP_SCRIPT = HERE / "fingerprint.py"
+FP_TIMEOUT = float(os.environ.get("BLAST_FP_TIMEOUT", "40"))
+USE_FP = os.environ.get("BLAST_USE_FP", "1") == "1"
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "150"))  # seconds for the batch
@@ -164,6 +173,67 @@ class Maps:
         if rel in self.src_names:
             return self.src.read(rel)
         return None
+
+    # ---- definition-time support (loaded on first use)
+    def _load(self, name: str) -> dict:
+        path = self.root / name
+        if not path.exists():
+            return {}
+        with gzip.open(path, "rt") as handle:
+            return json.load(handle)
+
+    @property
+    def attrs(self) -> dict:
+        if not hasattr(self, "_attrs"):
+            self._attrs = self._load("attrs.json.gz")
+            by_name: dict = {}
+            for key in self._attrs:
+                by_name.setdefault(key.rsplit("|", 1)[-1], []).append(key)
+            self._attrs_by_name = by_name
+        return self._attrs
+
+    def attr_readers(self, key: str) -> int:
+        enc = self.attrs.get(key)
+        return decode(enc) if enc is not None else 0
+
+    def attr_readers_named(self, name: str) -> int:
+        self.attrs  # noqa: B018 - load
+        bits = 0
+        for key in self._attrs_by_name.get(name, ()):
+            bits |= decode(self._attrs[key])
+        return bits
+
+    @property
+    def refs(self) -> dict:
+        if not hasattr(self, "_refs"):
+            self._refs = self._load("refs.json.gz")
+        return self._refs
+
+    @property
+    def funcs(self) -> dict:
+        if not hasattr(self, "_funcs"):
+            self._funcs = self._load("funcs.json.gz")
+        return self._funcs
+
+    def ref_tests(self, name: str) -> int:
+        """Tests that ran a line inside a function that mentions `name`."""
+        bits = 0
+        for rel, lines in self.refs.get(name, {}).items():
+            shard = self.shard(rel)
+            if shard is not None:
+                bits |= shard.executors(lines, ("f",))
+        return bits
+
+    def same_name_tests(self, name: str) -> int:
+        """Tests that called any function or method called `name`."""
+        bits = 0
+        for rel, spans in self.funcs.get(name, {}).items():
+            shard = self.shard(rel)
+            if shard is None:
+                continue
+            for start, end in spans:
+                bits |= shard.executors(range(start, end + 1), ("f",))
+        return bits
 
 
 # --------------------------------------------------------------------------- patches
@@ -457,13 +527,66 @@ class Scope:
         # code that runs at import) and lambdas; include both.
         return ("f",) if self.kind == "f" else ("d", "f")
 
+    @property
+    def import_time(self) -> bool:
+        """Runs once when the module is imported (module body or a class body
+        not nested in a function)."""
+        scope = self
+        while scope is not None:
+            if scope.kind == "f":
+                return False
+            scope = scope.parent
+        return True
+
 
 class Differ:
-    def __init__(self, shard: Shard, applied: Applied, reasons: list):
+    def __init__(self, shard: Shard, applied: Applied, reasons: list, use_fp: bool = False,
+                 same_name=None):
         self.shard = shard
         self.applied = applied
         self.tests = 0
         self.reasons = reasons
+        # Import-time data changes are resolved by the fingerprint diff when
+        # use_fp is set; `fallback` is what to select if that is unavailable.
+        self.use_fp = use_fp
+        self.need_fp = False
+        self.fallback = 0
+        self.same_name = same_name or (lambda name: 0)
+
+    def defer(self, scope: "Scope", lines, why: str) -> bool:
+        """Leave an import-time change to the fingerprint diff."""
+        if not (self.use_fp and scope.import_time):
+            return False
+        lines = list(lines)
+        self.need_fp = True
+        if lines and self.shard.executable(lines, scope.kinds):
+            self.fallback |= self.lines_tests(lines, scope.kinds)
+        else:
+            self.fallback |= self.shard.importers
+        self.reasons.append(f"{why} L{lines[0] if lines else '?'}: import-time -> fingerprint")
+        return True
+
+    def removed_stmt(self, stmt, block, index: int, scope: "Scope", why: str) -> int:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and self.use_fp and scope.import_time:
+            # Callers of the removed function (an override now falls back to
+            # the parent's implementation); decorators may have side effects.
+            self.defer(scope, span(stmt), why + " def")
+            return self.shard.executors(span(stmt), ("f",))
+        if isinstance(stmt, ast.ClassDef):
+            self.reasons.append(f"{why} class L{stmt.lineno}: importers")
+            return self.shard.importers
+        return self.stmt_tests(stmt, block, index, scope, why)
+
+    def added_stmts(self, stmts, block, at: int, scope: "Scope") -> int:
+        if self.use_fp and scope.import_time:
+            bits = 0
+            for stmt in stmts:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    bits |= self.same_name(stmt.name)
+                    self.reasons.append(f"new def {stmt.name}: same-name callers")
+            self.defer(scope, [], "inserted")
+            return bits
+        return self.point_tests(block, at - 1, at, scope, "inserted")
 
     # ---- mapping to tests
     def lines_tests(self, lines, kinds) -> int:
@@ -480,6 +603,8 @@ class Differ:
         for index in (before, after):
             if 0 <= index < len(block):
                 lines.extend(span(block[index]))
+        if self.defer(scope, lines, why):
+            return 0
         if lines and self.shard.executable(lines, scope.kinds):
             self.reasons.append(f"{why}: neighbours {lines[0]}-{lines[-1]}")
             return self.lines_tests(lines, scope.kinds)
@@ -488,6 +613,8 @@ class Differ:
 
     def stmt_tests(self, stmt, block, index: int, scope: Scope, why: str, lines=None) -> int:
         lines = list(lines if lines is not None else span(stmt))
+        if self.defer(scope, lines, why):
+            return 0
         if self.shard.executable(lines, scope.kinds):
             self.reasons.append(f"{why} {scope.kind} L{lines[0]}-{lines[-1]}")
             return self.lines_tests(lines, scope.kinds)
@@ -555,15 +682,16 @@ class Differ:
                         if type(a) is type(b):
                             self.stmt(a, b, old_block, oi + a1 + k, scope)
                         else:
-                            self.tests |= self.stmt_tests(a, old_block, oi + a1 + k, scope, "replaced")
+                            self.tests |= self.removed_stmt(a, old_block, oi + a1 + k, scope, "replaced")
+                            self.tests |= self.added_stmts([b], old_block, oi + a1 + k, scope)
                     continue
                 for k in range(a1, a2):
-                    self.tests |= self.stmt_tests(old_seg[k], old_block, oi + k, scope, "deleted")
+                    self.tests |= self.removed_stmt(old_seg[k], old_block, oi + k, scope, "deleted")
                 if b2 > b1:
                     at = oi + a1
                     if self.only_docstring_insert(new_seg[b1:b2], at, scope):
                         continue
-                    self.tests |= self.point_tests(old_block, at - 1, at, scope, "inserted")
+                    self.tests |= self.added_stmts(new_seg[b1:b2], old_block, at, scope)
 
     def only_docstring_insert(self, stmts, at: int, scope: Scope) -> bool:
         return at == 0 and len(stmts) == 1 and is_docstring(stmts[0]) and not isinstance(
@@ -586,15 +714,25 @@ class Differ:
             inner = Scope("f", a, scope)
             if header_changed:
                 head = range(start_line(a), max(a.lineno, a.body[0].lineno - 1) + 1)
-                self.tests |= self.stmt_tests(a, block, index, scope, "def header", head)
+                # Callers see new defaults/decorators; a rename also reaches
+                # functions of the new name it may now override.
                 self.tests |= self.shard.executors(span(a), ("f",))
+                if a.name != b.name:
+                    self.tests |= self.same_name(b.name)
+                self.tests |= self.stmt_tests(a, block, index, scope, "def header", head)
             self.block(a.body, b.body, inner)
             return
         if isinstance(a, ast.ClassDef):
             inner = Scope("d", a, scope)
             if header_changed:
                 head = range(start_line(a), max(a.lineno, a.body[0].lineno - 1) + 1)
-                self.tests |= self.stmt_tests(a, block, index, scope, "class header", head)
+                if self.use_fp and scope.import_time:
+                    # A new name, base or metaclass changes how everything in
+                    # the class resolves: stay conservative.
+                    self.reasons.append(f"class header L{a.lineno}: importers")
+                    self.tests |= self.shard.importers
+                else:
+                    self.tests |= self.stmt_tests(a, block, index, scope, "class header", head)
             self.block(a.body, b.body, inner)
             return
         if header_changed:
@@ -683,6 +821,15 @@ class Differ:
 
 
 # --------------------------------------------------------------------------- per file
+
+def module_name(rel: str) -> str | None:
+    if not rel.endswith(".py"):
+        return None
+    module = rel[:-3].replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+    return module
+
 
 PYTEST_CONFIG_FILES = {"pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"}
 BUILD_TEST_FILES = ("tests/test_build.py", "tests/test_sqlglotc.py")
@@ -783,6 +930,9 @@ class Selector:
         if not patches:
             reasons.append("no file changes found")
             return 0
+        # Import-time changes are collected over the whole commit, then
+        # resolved by one fingerprint run of the patched package.
+        self.pending = {"overrides": {}, "deleted": [], "need": False, "fallback": 0}
         bits = 0
         for fp in patches:
             try:
@@ -790,7 +940,83 @@ class Selector:
             except Exception as error:  # never lose a commit to a bug here
                 reasons.append(f"{fp.path}: analysis failed ({error!r}); broad fallback")
                 bits |= self.broad(fp)
+        if self.pending["need"]:
+            bits |= self.resolve_fingerprint(reasons)
         return bits
+
+    @property
+    def fp_available(self) -> bool:
+        return USE_FP and FP_BASELINE.exists() and (PRISTINE / "sqlglot").is_dir() and FP_SCRIPT.exists()
+
+    def resolve_fingerprint(self, reasons: list) -> int:
+        pending = self.pending
+        request = {
+            "root": str(PRISTINE),
+            "overrides": pending["overrides"],
+            "deleted": pending["deleted"],
+            "baseline": str(FP_BASELINE),
+        }
+        env = {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-P", "-s", str(FP_SCRIPT)],
+                input=json.dumps(request), capture_output=True, text=True,
+                timeout=FP_TIMEOUT, env=env,
+            )
+            result = json.loads(proc.stdout)
+        except Exception as error:
+            reasons.append(f"fingerprint unavailable ({error!r}); import-time fallback")
+            return pending["fallback"]
+        if not result.get("ok"):
+            reasons.append(f"patched sqlglot does not import ({result.get('error', '')[:80]}); fallback")
+            bits = pending["fallback"]
+            for module in pending["overrides"]:
+                bits |= self.module_importers(module)
+            return bits
+        bits = 0
+        for name, kind, _message in result.get("failed", []):
+            bits |= self.module_importers(name)
+            reasons.append(f"fingerprint: {name} no longer imports ({kind})")
+        for key in result.get("changed", []) + result.get("removed", []):
+            bits |= self.key_tests(key, added=False)
+        for key in result.get("added", []):
+            bits |= self.key_tests(key, added=True)
+        changed = result.get("changed", []) + result.get("added", []) + result.get("removed", [])
+        reasons.append(f"fingerprint: {len(changed)} changed values {changed[:4]}")
+        return bits
+
+    def module_importers(self, module: str) -> int:
+        base = module.replace(".", "/")
+        for rel in (base + ".py", base + "/__init__.py"):
+            shard = self.maps.shard(rel)
+            if shard is not None:
+                return shard.importers
+        return 0
+
+    def key_tests(self, key: str, added: bool) -> int:
+        module, qual, name = key.split("|", 2)
+        bits = 0
+        if qual:
+            if name == "__bases__":
+                return self.module_importers(module)
+            if key in self.maps.attrs:
+                # A data attribute: the tests that read it at run time.
+                bits |= self.maps.attr_readers(key)
+            else:
+                # Never read as data at run time: a method (rebound, new
+                # defaults) or an unused constant. Callers of that name.
+                bits |= self.maps.same_name_tests(name)
+            if added:
+                # A new attribute may shadow one inherited from a parent.
+                bits |= self.maps.attr_readers_named(name)
+            return bits
+        # Module global: functions that mention it, and functions of that name.
+        return self.maps.ref_tests(name) | self.maps.same_name_tests(name)
 
     def broad(self, fp: FilePatch) -> int:
         bits = 0
@@ -826,6 +1052,9 @@ class Selector:
                 bits |= shard.importers | shard.readers
             bits |= self.maps.readers(target) | self.maps.listers(posixpath.dirname(target))
             reasons.append(f"{target}: removed/renamed")
+            module = module_name(target)
+            if module and module.startswith("sqlglot"):
+                self.pending["deleted"].append(module)
             if fp.is_deleted:
                 return bits
         if fp.is_new or renamed:
@@ -834,6 +1063,13 @@ class Selector:
             bits |= self.maps.readers(target)
             bits |= self.maps.import_attempts(target)
             reasons.append(f"{target}: added")
+            module = module_name(target)
+            if module and module.startswith("sqlglot") and fp.hunks:
+                # Imported by name from changed code, or registering itself.
+                self.pending["overrides"][module] = "".join(
+                    t + "\n" for h in fp.hunks for tag, t in h.lines if tag == "+"
+                )
+                self.pending["need"] = self.pending["need"] or self.fp_available
             return bits
         if fp.binary:
             reasons.append(f"{rel}: binary change")
@@ -910,8 +1146,21 @@ class Selector:
             reasons.append(f"{rel}: no longer compiles ({type(error).__name__}) -> importers")
             return shard.importers | readers
         old_tree = self.old_tree(rel, old_source)
-        differ = Differ(shard, applied, reasons)
+        module = module_name(rel)
+        importable = bool(module and module.startswith("sqlglot."))
+        if importable:
+            # Every changed module is imported patched, so values other
+            # modules derive from it at import time come out right too.
+            self.pending["overrides"][module] = applied.new_text
+        differ = Differ(
+            shard, applied, reasons,
+            use_fp=importable and self.fp_available,
+            same_name=self.maps.same_name_tests,
+        )
         differ.block(old_tree.body, new_tree.body, Scope("d", None, None))
+        if differ.need_fp:
+            self.pending["need"] = True
+            self.pending["fallback"] |= differ.fallback
         return differ.tests | readers
 
 

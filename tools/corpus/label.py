@@ -112,7 +112,9 @@ def main() -> int:
         commit = patch.stem
         workdir = args.work / commit
         shutil.rmtree(workdir, ignore_errors=True)
-        shutil.copytree(args.src, workdir, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        # Bytecode is copied too (copytree keeps mtimes, so it stays valid for
+        # unchanged files; a patched file gets a new mtime and recompiles).
+        shutil.copytree(args.src, workdir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
         result = {"commit": commit}
         try:
             apply_patch(blast, workdir, patch.read_text("utf-8"))

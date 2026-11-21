@@ -43,6 +43,7 @@ def main() -> int:
     parser.add_argument("--kinds", action="store_true", help="break totals down by commit kind")
     parser.add_argument("--only", default="", help="comma separated commit ids")
     parser.add_argument("--reasons", action="store_true")
+    parser.add_argument("--dump", type=Path, help="write per-commit selections as JSON")
     args = parser.parse_args()
 
     sel = load_selector(args.data, args.maps)
@@ -65,6 +66,8 @@ def main() -> int:
         commit = patch.stem
         if only and commit not in only:
             continue
+        if commit not in answers:
+            continue  # unlabeled (e.g. the suite hung on it)
         reasons: list = []
         bits = selector.commit(patch.read_text("utf-8", "replace"), reasons)
         chosen = [n for n in ms if bits >> n & 1]
@@ -76,6 +79,8 @@ def main() -> int:
         rows.append({
             "commit": commit,
             "kind": answers[commit].get("kind", "?"),
+            "chosen": chosen,
+            "failing": failing,
             "n": len(chosen),
             "cost": cost,
             "oracle": oracle,
@@ -84,6 +89,8 @@ def main() -> int:
             "heavy": [names[n].split("::")[-1] for n in chosen if ms[n] > 2500],
         })
 
+    if args.dump:
+        args.dump.write_text(json.dumps(rows, indent=0))
     total = sum(r["cost"] for r in rows)
     oracle = sum(r["oracle"] for r in rows)
     misses = [r for r in rows if r["missed"]]

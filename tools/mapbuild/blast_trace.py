@@ -207,25 +207,41 @@ def _install_attr_recorder(reads: set) -> None:
                 pass
 
     def scan(force: bool = False) -> None:
-        count = len(sys.modules)
-        if not force and count == module_count[0]:
+        names = [name for name in list(sys.modules) if name.startswith("sqlglot")]
+        if not force and len(names) == module_count[0]:
             return
-        module_count[0] = count
-        stack = [object]
+        module_count[0] = len(names)
+        # Start from the classes sqlglot's modules define; their subclasses
+        # (including ones a metaclass made with type(...)) are reached below.
+        stack = []
+        for name in names:
+            module = sys.modules.get(name)
+            if module is None:
+                continue
+            for value in list(vars(module).values()):
+                if isinstance(value, type):
+                    stack.append(value)
         seen = set()
         while stack:
             cls = stack.pop()
+            if id(cls) in seen:
+                continue
+            seen.add(id(cls))
+            if id(cls) not in wrapped:
+                wrap(cls)
             try:
                 subs = type.__subclasses__(cls)
             except TypeError:
                 continue
             for sub in subs:
-                if id(sub) in seen:
-                    continue
-                seen.add(id(sub))
-                if id(sub) not in wrapped:
-                    wrap(sub)
-                stack.append(sub)
+                if id(sub) not in seen:
+                    stack.append(sub)
+            # Nested classes (e.g. Snowflake.Tokenizer) and classes held in
+            # class attributes (parser_class...) are reachable through dicts.
+            for value in list(cls.__dict__.values()):
+                inner = value.value if isinstance(value, Rec) else value
+                if isinstance(inner, type) and id(inner) not in seen:
+                    stack.append(inner)
 
     original_import = builtins.__import__
     original_import_module = importlib.import_module
