@@ -27,7 +27,15 @@ and `python -c` subprocesses the tests start. For each test it records:
 1. Apply the hunks to the pinned source and compare old and new syntax
    trees statement by statement, only where the hunks are.
 2. A changed statement inside a function selects the tests that executed
-   its lines at run time. A change confined to a lambda body selects only
+   its lines at run time. When the only change is a comparison operator or
+   a literal compared against, the comparison map narrows that further:
+   every test was also run with each comparison in sqlglot instrumented
+   (`tools/mapbuild/cmp_trace.py`), recording how the two sides related
+   each time (identical, equal, less, greater, or the value compared with
+   a literal). A test whose every recorded comparison gives the same
+   answer under the new operator or literal runs exactly as before and is
+   not selected; untraced tests and tests that did not reach the line in
+   that run stay selected. A change confined to a lambda body selects only
    that lambda's callers. Statements with no bytecode (or dead code) fall
    back to the tests that reach the neighbouring statements.
 3. Comment, whitespace and docstring edits change nothing a test can

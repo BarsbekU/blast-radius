@@ -8,6 +8,7 @@ COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY tools/mapbuild/blast_trace.py /usr/local/lib/python3.13/site-packages/blast_trace.py
+COPY tools/mapbuild/cmp_trace.py /usr/local/lib/python3.13/site-packages/cmp_trace.py
 RUN echo "import blast_trace" > /usr/local/lib/python3.13/site-packages/zz_blast_trace.pth
 
 # sqlglot at the pinned commit (work/sqlglot is a checkout of eb11aec), the

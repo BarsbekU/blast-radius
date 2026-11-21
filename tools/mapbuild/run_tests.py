@@ -32,6 +32,8 @@ def main() -> int:
     parser.add_argument("--only", default="", help="comma separated test numbers")
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--no-trace", action="store_true")
+    parser.add_argument("--cmp", action="store_true", help="comparison trace (cmp_trace.py) instead of line trace")
+    parser.add_argument("--cmp-cache", default="", help="shared cache of rewritten module code")
     parser.add_argument("--src", default="/src")
     args = parser.parse_args()
 
@@ -66,7 +68,13 @@ def main() -> int:
         env["PYTHONHASHSEED"] = str(args.seed)
         env["SKIP_INTEGRATION"] = "0"
         env.pop("BLAST_TRACE_DIR", None)
-        if not args.no_trace:
+        env.pop("BLAST_CMP_DIR", None)
+        if args.cmp:
+            env["BLAST_CMP_DIR"] = trace_dir
+            env["BLAST_TRACE_ROOT"] = args.src.rstrip("/") + "/"
+            if args.cmp_cache:
+                env["BLAST_CMP_CACHE"] = args.cmp_cache
+        elif not args.no_trace:
             env["BLAST_TRACE_DIR"] = trace_dir
             env["BLAST_TRACE_ROOT"] = args.src.rstrip("/") + "/"
         t0 = time.monotonic()

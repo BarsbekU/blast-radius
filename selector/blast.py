@@ -89,6 +89,10 @@ TPC_SAMPLE_MAX = int(os.environ.get("BLAST_TPC_SAMPLE_MAX", "16"))
 # broad selections, lines outside the profiled queries) are decided the same
 # way, with every query a candidate.
 TPC_BROAD_SAMPLE = os.environ.get("BLAST_TPC_BROAD_SAMPLE", "1") == "1"
+# Comparison map: when a statement changes only comparison operators (or
+# literals compared against), keep only the tests for which some recorded
+# evaluation would come out differently.
+CMP_REFINE = os.environ.get("BLAST_CMP_REFINE", "1") == "1"
 # Scaled-down proxy for the 28.8 s test_max_nodes (BLAST_PROXY_MAX_NODES=0 turns it off).
 PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
@@ -320,6 +324,31 @@ class Maps:
                 out[test] = {"queries": queries, "queries_d": queries_d, "P": union_p, "D": union_d}
             self._exec_lines = out
         return self._exec_lines
+
+    @property
+    def cmp(self):
+        """Comparison map (tools/mapbuild/cmp_trace.py): per comparison site,
+        how its operands related in each test. None when absent."""
+        if not hasattr(self, "_cmp"):
+            self._cmp = None
+            path = self.root / "cmp.json.gz"
+            if CMP_REFINE and path.exists():
+                with gzip.open(path, "rt") as handle:
+                    raw = json.load(handle)
+                traced = 0
+                for n in raw["traced"]:
+                    traced |= 1 << n
+                raw["traced_bits"] = traced
+                raw["_dec"] = {}
+                self._cmp = raw
+        return self._cmp
+
+    def cmp_set(self, i: int) -> int:
+        dec = self._cmp["_dec"]
+        v = dec.get(i)
+        if v is None:
+            v = dec[i] = int(self._cmp["sets"][i], 16)
+        return v
 
     @property
     def fixture_deps(self) -> dict:
@@ -690,6 +719,140 @@ class Scope:
         return True
 
 
+CMP_OPS = {
+    ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+    ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in",
+}
+CMP_RELS = ("is", "==", "<", "<=", ">", ">=")
+
+
+def _cmp_literal(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return isinstance(node.operand, ast.Constant)
+    if isinstance(node, ast.Tuple):
+        return all(_cmp_literal(e) for e in node.elts)
+    return False
+
+
+def cmp_changes(x, y):
+    """[(old Compare node, new op or None, literal side or None, new literal
+    or None)] when x and y differ only in single-comparison operators and in
+    literal operands of single comparisons; None otherwise."""
+    if x is None and y is None:
+        return []
+    if isinstance(x, list) or isinstance(y, list):
+        if not (isinstance(x, list) and isinstance(y, list)) or len(x) != len(y):
+            return None
+        out = []
+        for a, b in zip(x, y):
+            got = cmp_changes(a, b)
+            if got is None:
+                return None
+            out.extend(got)
+        return out
+    if not isinstance(x, ast.AST) or not isinstance(y, ast.AST):
+        return [] if eq(x, y) else None
+    # Comparison operator nodes are compared through Compare.ops below.
+    nx = [n for n in ast.walk(x) if not isinstance(n, ast.cmpop)]
+    ny = [n for n in ast.walk(y) if not isinstance(n, ast.cmpop)]
+    if len(nx) != len(ny) or any(type(a) is not type(b) for a, b in zip(nx, ny)):
+        return None
+    out = []
+    skip = set()  # ids of nodes inside literal operands (compared as values)
+    for a, b in zip(nx, ny):
+        if not isinstance(a, ast.Compare):
+            continue
+        same_ops = all(type(o1) is type(o2) for o1, o2 in zip(a.ops, b.ops))
+        if len(a.ops) != 1:
+            if not same_ops:
+                return None
+            continue
+        if type(a.ops[0]) not in CMP_OPS or type(b.ops[0]) not in CMP_OPS:
+            return None
+        new_op = None if same_ops else CMP_OPS[type(b.ops[0])]
+        side, new_lit = None, None
+        for s, oa, ob in (("R", a.comparators[0], b.comparators[0]), ("L", a.left, b.left)):
+            if _cmp_literal(oa) and _cmp_literal(ob):
+                for n in ast.walk(oa):
+                    skip.add(id(n))
+                if not eq(oa, ob):
+                    if side is not None:
+                        return None
+                    try:
+                        new_lit = ast.literal_eval(ob)
+                        ast.literal_eval(oa)
+                    except (ValueError, SyntaxError):
+                        return None
+                    side = s
+        if new_op is not None or side is not None:
+            out.append((a, new_op, side, new_lit))
+    # Everything else must be identical.
+    for a, b in zip(nx, ny):
+        if id(a) in skip:
+            continue
+        for name in a._fields:
+            if isinstance(a, ast.Compare) and name == "ops":
+                continue
+            va, vb = getattr(a, name, None), getattr(b, name, None)
+            if isinstance(va, ast.AST) or isinstance(vb, ast.AST):
+                continue  # compared as nodes of the walk
+            if isinstance(va, list) or isinstance(vb, list):
+                if not (isinstance(va, list) and isinstance(vb, list)) or len(va) != len(vb):
+                    return None
+                for ea, eb in zip(va, vb):
+                    if not isinstance(ea, ast.AST) and ea != eb:
+                        return None
+                continue
+            if va != vb or type(va) is not type(vb):
+                return None
+    return out
+
+
+def _cmp_outcome(op: str, rels: str):
+    """Result of `a op b` from a recorded relation string, or None."""
+    if rels[:1] == "E":
+        return None  # the original comparison raised
+    flip = op in ("!=", "is not")
+    base = {"!=": "==", "is not": "is"}.get(op, op)
+    if base not in CMP_RELS:
+        return None
+    c = rels[CMP_RELS.index(base)] if len(rels) > CMP_RELS.index(base) else "?"
+    if c not in "01":
+        return None
+    return (c == "1") != flip
+
+
+def cmp_sig_differs(sig: str, old_op: str, new_op: str) -> bool:
+    rels = sig.partition("|")[2]
+    a = _cmp_outcome(old_op, rels)
+    b = _cmp_outcome(new_op, rels)
+    return a is None or b is None or a != b
+
+
+def cmp_value_differs(rep_: str, old_op: str, new_op: str, old_lit, new_lit, side: str) -> bool:
+    if rep_ == "*" or "is" in (old_op, new_op) or "is not" in (old_op, new_op):
+        return True  # unknown value, or identity of rebuilt literals proves nothing
+    try:
+        v = ast.literal_eval(rep_)
+    except (ValueError, SyntaxError):
+        return True
+    import operator as _o
+
+    funcs = {"==": _o.eq, "!=": _o.ne, "<": _o.lt, "<=": _o.le, ">": _o.gt, ">=": _o.ge}
+    if old_op not in funcs or new_op not in funcs:
+        return True
+    try:
+        if side == "R":
+            before, after = funcs[old_op](v, old_lit), funcs[new_op](v, new_lit)
+        else:
+            before, after = funcs[old_op](old_lit, v), funcs[new_op](new_lit, v)
+    except Exception:  # noqa: BLE001
+        return True
+    return bool(before) != bool(after)
+
+
 class Differ:
     def __init__(self, shard: Shard, applied: Applied, reasons: list, use_fp: bool = False,
                  same_name=None):
@@ -1010,8 +1173,13 @@ class Differ:
                 for node in value if isinstance(value, list) else [value]:
                     if isinstance(node, ast.AST) and getattr(node, "end_lineno", None):
                         last = max(last, node.end_lineno)
-            self.tests |= self.stmt_tests(a, block, index, scope, type(a).__name__ + " header",
-                                          range(a.lineno, last + 1))
+            pairs = [(getattr(a, f, None), getattr(b, f, None)) for f in header]
+            refined = self.cmp_refine(pairs, scope, range(a.lineno, last + 1))
+            if refined is not None:
+                self.tests |= refined
+            else:
+                self.tests |= self.stmt_tests(a, block, index, scope, type(a).__name__ + " header",
+                                              range(a.lineno, last + 1))
         for field in ("body", "orelse", "finalbody"):
             old_body = getattr(a, field, None)
             new_body = getattr(b, field, None)
@@ -1063,7 +1231,71 @@ class Differ:
                 else:
                     self.tests |= self.stmt_tests(a, block, index, scope, "lambda (no bytecode)")
             return
+        refined = self.cmp_refine([(a, b)], scope, span(a))
+        if refined is not None:
+            self.tests |= refined
+            return
         self.tests |= self.stmt_tests(a, block, index, scope, "stmt")
+
+    # ---- comparison map
+    def cmp_refine(self, pairs, scope: "Scope", lines):
+        """Tests affected when the only differences between the old and new
+        nodes are comparison operators or literals compared against; None
+        when that is not the case or there is no data."""
+        cmp = getattr(self, "cmp_map", None)
+        if cmp is None or scope.kind != "f" or not getattr(self, "rel", None):
+            return None
+        changes = []
+        for x, y in pairs:
+            got = cmp_changes(x, y)
+            if got is None:
+                return None
+            changes.extend(got)
+        if not changes:
+            return None
+        lines = list(lines)
+        execs = self.lines_tests(lines, ("f",))
+        maps = self.maps_ref
+        affected = execs & ~cmp["traced_bits"]
+        for node, new_op, lit_side, new_lit in changes:
+            key = f"{self.rel}:{node.lineno}:{node.col_offset}:{node.end_lineno}:{node.end_col_offset}"
+            site = cmp["sites"].get(key)
+            ran_i = cmp["ran"].get(f"{self.rel}:{node.lineno}")
+            ran_bits = maps.cmp_set(ran_i) if ran_i is not None else 0
+            # Reached the line in some seed's coverage but not in the traced
+            # run: nothing is known about its comparisons.
+            affected |= execs & ~ran_bits
+            if site is None:
+                continue  # the comparison never ran in any traced test
+            old_op = CMP_OPS[type(node.ops[0])]
+            op = new_op or old_op
+            if new_lit is None:
+                for sig, i in site["s"].items():
+                    if cmp_sig_differs(sig, old_op, op):
+                        affected |= maps.cmp_set(i)
+                continue
+            # A literal changed (maybe the operator too): decide per value.
+            try:
+                old_lit = ast.literal_eval(node.comparators[0] if lit_side == "R" else node.left)
+            except (ValueError, SyntaxError):
+                affected |= execs
+                continue
+            vals = site.get("v")
+            if not vals:
+                affected |= execs
+                continue
+            for value, i in vals.items():
+                if cmp_value_differs(value, old_op, op, old_lit, new_lit, lit_side):
+                    affected |= maps.cmp_set(i)
+            # Evaluations that raised: the new literal may not.
+            for sig, i in site["s"].items():
+                if sig.partition("|")[2][:1] == "E":
+                    affected |= maps.cmp_set(i)
+        result = execs & affected
+        self.reasons.append(
+            f"comparison change L{lines[0]}: {bin(result).count('1')} of {bin(execs).count('1')} tests can see it"
+        )
+        return result
 
     def expr_diff(self, a, b, lam, out: list) -> None:
         if type(a) is not type(b):
@@ -1843,6 +2075,9 @@ class Selector:
             same_name=self.maps.same_name_tests,
         )
         differ.future_annotations = has_future_annotations(old_tree) and has_future_annotations(new_tree)
+        differ.rel = rel
+        differ.maps_ref = self.maps
+        differ.cmp_map = self.maps.cmp
         differ.block(old_tree.body, new_tree.body, Scope("d", None, None))
         if differ.need_fp:
             self.pending["need"] = True

@@ -509,3 +509,9 @@ def _install_attr_recorder(reads: set) -> None:
 _out = os.environ.get("BLAST_TRACE_DIR")
 if _out:
     _install(_out)
+
+_cmp_out = os.environ.get("BLAST_CMP_DIR")
+if _cmp_out:
+    import cmp_trace
+
+    cmp_trace.install(_cmp_out)
