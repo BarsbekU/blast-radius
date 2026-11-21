@@ -1,4 +1,6 @@
 IMAGE ?= blast-radius-entry
+# On Windows `python3` is often the Microsoft Store stub; run `make sample PYTHON=python`.
+PYTHON ?= python3
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 
@@ -20,10 +22,10 @@ build:
 # scores what it printed.
 sample: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
-	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
+	$(PYTHON) score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
 
 # The output's rules only: every line well formed and every commit answered.
 # A wrong selection still passes here; make sample counts the misses.
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
-	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+	$(PYTHON) score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
