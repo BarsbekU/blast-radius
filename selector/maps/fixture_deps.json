@@ -1,0 +1,12 @@
+{
+ "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {
+  "1106": "inputs",
+  "1107": "none",
+  "1123": "none"
+ },
+ "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+  "1106": "none",
+  "1107": "inputs",
+  "1123": "all"
+ }
+}

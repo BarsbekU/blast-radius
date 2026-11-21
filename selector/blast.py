@@ -57,9 +57,46 @@ VERIFY_TREE = Path(os.environ.get("BLAST_VERIFY_TREE", str(HERE / "tree")))
 HEAVY_MS = int(float(os.environ.get("BLAST_HEAVY_SECONDS", "2.5")) * 1000)
 VERIFY_MIN_PROXIES = int(os.environ.get("BLAST_VERIFY_MIN_PROXIES", "1"))
 VERIFY_TIMEOUT = float(os.environ.get("BLAST_VERIFY_TIMEOUT", "60"))
+# TPC executor tests: drop them when every changed line they run is in the
+# query pipeline and the pipeline outputs of the affected queries are
+# unchanged (selector/exec_check.py, tools/mapbuild/exec_profile.py).
+EXEC_CHECK = os.environ.get("BLAST_EXEC_CHECK", "1") == "1"
+EXEC_CHECK_SCRIPT = HERE / "exec_check.py"
+EXEC_CHECK_TIMEOUT = float(os.environ.get("BLAST_EXEC_CHECK_TIMEOUT", "60"))
+EXEC_TESTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",
+}
+OPTIMIZED_TPCH = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
 WORKER_MS = 2000
 MAX_WORKERS = 8
-TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "150"))  # seconds for the batch
+TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "0"))  # 0: derive from batch size
+
+
+class Budget:
+    """Wall-clock guard. The run limit is 3 min for the practice batch and
+    4.5 min for the final (~1.5x the commits); stay well inside it by
+    dropping the optional subprocess steps (exec check first, then
+    fingerprints) when time gets short. Line-level selection itself takes
+    milliseconds per commit, so it always runs."""
+
+    def __init__(self, commits: int):
+        limit = 180.0 if commits <= 45 else 270.0
+        self.total = TIME_BUDGET or 0.55 * limit
+        self.commits = max(commits, 1)
+        self.done = 0
+
+    def remaining(self) -> float:
+        return self.total - (time.monotonic() - STARTED)
+
+    def allow(self, cost: float) -> bool:
+        """Can we spend about `cost` seconds now and keep 0.3 s for every
+        commit still to come?"""
+        left = self.commits - self.done
+        return self.remaining() - cost > 0.3 * left + 5
+
+
+BUDGET = Budget(0)
 VERBOSE = os.environ.get("BLAST_VERBOSE", "1") == "1"
 
 STARTED = time.monotonic()
@@ -212,6 +249,35 @@ class Maps:
         return bits
 
     @property
+    def exec_lines(self) -> dict:
+        """Per TPC test: per query pipeline/data line sets, and their unions."""
+        if not hasattr(self, "_exec_lines"):
+            raw = self._load("exec_lines.json.gz")
+            out = {}
+            for test, records in raw.items():
+                queries = []
+                union_p: dict = {}
+                union_d: dict = {}
+                for rec in records:
+                    p = {f: set(l) for f, l in rec["P"].items()}
+                    d = {f: set(l) for f, l in rec["D"].items()}
+                    for f, l in p.items():
+                        union_p.setdefault(f, set()).update(l)
+                    for f, l in d.items():
+                        union_d.setdefault(f, set()).update(l)
+                    queries.append(p)
+                out[test] = {"queries": queries, "P": union_p, "D": union_d}
+            self._exec_lines = out
+        return self._exec_lines
+
+    @property
+    def fixture_deps(self) -> dict:
+        if not hasattr(self, "_fixture_deps"):
+            path = self.root / "fixture_deps.json"
+            self._fixture_deps = json.loads(path.read_text()) if path.exists() else {}
+        return self._fixture_deps
+
+    @property
     def refs(self) -> dict:
         if not hasattr(self, "_refs"):
             self._refs = self._load("refs.json.gz")
@@ -223,24 +289,50 @@ class Maps:
             self._funcs = self._load("funcs.json.gz")
         return self._funcs
 
-    def ref_tests(self, name: str) -> int:
-        """Tests that ran a line inside a function that mentions `name`."""
+    def ref_tests(self, name: str, module: str | None = None) -> int:
+        """Tests that ran a line inside a function that reads this global:
+        through its own module or an import of it when `module` is given
+        (qrefs, import-resolved), else any mention of the name."""
+        if not hasattr(self, "_qrefs"):
+            self._qrefs = self._load("qrefs.json.gz")
+        table = None
+        if module is not None and self._qrefs:
+            table = self._qrefs.get(f"{module}||{name}")  # None: not resolvable
+        if table is None:
+            table = self.refs.get(name, {})
         bits = 0
-        for rel, lines in self.refs.get(name, {}).items():
+        for rel, lines in table.items():
             shard = self.shard(rel)
             if shard is not None:
                 bits |= shard.executors(lines, ("f",))
         return bits
 
-    def same_name_tests(self, name: str) -> int:
+    def same_name_tests(self, name: str, only_file: str | None = None) -> int:
         """Tests that called any function or method called `name`."""
         bits = 0
         for rel, spans in self.funcs.get(name, {}).items():
+            if only_file is not None and rel != only_file:
+                continue
             shard = self.shard(rel)
             if shard is None:
                 continue
             for start, end in spans:
                 bits |= shard.executors(range(start, end + 1), ("f",))
+        return bits
+
+    def class_users(self, module: str, qual: str) -> int:
+        """Tests that read any data attribute defined on this class."""
+        self.attrs  # noqa: B018 - load
+        prefix = f"{module}|{qual}|"
+        if not hasattr(self, "_by_class"):
+            by_class: dict = {}
+            for key in self._attrs:
+                head = key.rsplit("|", 1)[0] + "|"
+                by_class.setdefault(head, []).append(key)
+            self._by_class = by_class
+        bits = 0
+        for key in self._by_class.get(prefix, ()):
+            bits |= decode(self._attrs[key])
         return bits
 
 
@@ -560,6 +652,11 @@ class Differ:
         self.need_fp = False
         self.fallback = 0
         self.same_name = same_name or (lambda name: 0)
+        # Old-file lines whose executors were selected, and whether anything
+        # was selected more broadly (whole scope, importers, same name).
+        self.touched: set = set()
+        self.broad = False
+        self.future_annotations = False
 
     def defer(self, scope: "Scope", lines, why: str) -> bool:
         """Leave an import-time change to the fingerprint diff."""
@@ -579,29 +676,33 @@ class Differ:
             # Callers of the removed function (an override now falls back to
             # the parent's implementation); decorators may have side effects.
             self.defer(scope, span(stmt), why + " def")
-            return self.shard.executors(span(stmt), ("f",))
+            return self.lines_tests(span(stmt), ("f",))
         if isinstance(stmt, ast.ClassDef):
             self.reasons.append(f"{why} class L{stmt.lineno}: importers")
+            self.broad = True
             return self.shard.importers
         return self.stmt_tests(stmt, block, index, scope, why)
 
     def added_stmts(self, stmts, block, at: int, scope: "Scope") -> int:
         if self.use_fp and scope.import_time:
-            bits = 0
+            # New methods show up as added fingerprint keys (callers of the
+            # name among tests using the class); this is only the fallback.
             for stmt in stmts:
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    bits |= self.same_name(stmt.name)
-                    self.reasons.append(f"new def {stmt.name}: same-name callers")
+                    self.fallback |= self.same_name(stmt.name)
             self.defer(scope, [], "inserted")
-            return bits
+            return 0
         return self.point_tests(block, at - 1, at, scope, "inserted")
 
     # ---- mapping to tests
     def lines_tests(self, lines, kinds) -> int:
+        lines = list(lines)
+        self.touched.update(lines)
         return self.shard.executors(lines, kinds)
 
     def scope_tests(self, scope: Scope) -> int:
         """Every test that can reach code in this scope."""
+        self.broad = True
         if scope.kind == "f" and scope.node is not None:
             return self.shard.executors(span(scope.node), ("f",))
         return self.shard.importers
@@ -720,13 +821,22 @@ class Differ:
         header_changed = any(not eq(getattr(a, f, None), getattr(b, f, None)) for f in header)
         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
             inner = Scope("f", a, scope)
+            if header_changed and self.future_annotations and annotations_only(a, b):
+                # Under `from __future__ import annotations` parameter and
+                # return annotations are strings nothing in sqlglot reads.
+                self.reasons.append(f"annotation-only header L{a.lineno}: no effect")
+                header_changed = False
             if header_changed:
                 head = range(start_line(a), max(a.lineno, a.body[0].lineno - 1) + 1)
                 # Callers see new defaults/decorators; a rename also reaches
                 # functions of the new name it may now override.
-                self.tests |= self.shard.executors(span(a), ("f",))
+                self.tests |= self.lines_tests(span(a), ("f",))
                 if a.name != b.name:
-                    self.tests |= self.same_name(b.name)
+                    if self.use_fp and scope.import_time:
+                        self.fallback |= self.same_name(b.name)
+                    else:
+                        self.broad = True
+                        self.tests |= self.same_name(b.name)
                 self.tests |= self.stmt_tests(a, block, index, scope, "def header", head)
             self.block(a.body, b.body, inner)
             return
@@ -738,6 +848,7 @@ class Differ:
                     # A new name, base or metaclass changes how everything in
                     # the class resolves: stay conservative.
                     self.reasons.append(f"class header L{a.lineno}: importers")
+                    self.broad = True
                     self.tests |= self.shard.importers
                 else:
                     self.tests |= self.stmt_tests(a, block, index, scope, "class header", head)
@@ -785,6 +896,13 @@ class Differ:
     def simple(self, a, b, block, index: int, scope: Scope) -> None:
         """A simple statement changed. If every difference sits inside lambda
         bodies, only the callers of those lambdas can notice."""
+        if (
+            isinstance(a, ast.AnnAssign) and scope.kind == "f"
+            and eq(a.target, b.target) and eq(a.value, b.value) and a.simple == b.simple
+        ):
+            # Python never evaluates annotations of local variables.
+            self.reasons.append(f"local annotation L{a.lineno}: no effect")
+            return
         diffs: list = []
         self.expr_diff(a, b, None, diffs)
         if diffs and all(lam is not None for _, lam in diffs):
@@ -829,6 +947,43 @@ class Differ:
 
 
 # --------------------------------------------------------------------------- per file
+
+def has_future_annotations(tree: ast.Module) -> bool:
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__":
+            if any(alias.name == "annotations" for alias in stmt.names):
+                return True
+    return False
+
+
+def annotations_only(a, b) -> bool:
+    """Do two function definitions differ only in annotations?"""
+    def strip(node):
+        args = node.args
+        parts = [node.name, node.decorator_list, node.type_params if hasattr(node, "type_params") else None]
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+            parts.append(None if arg is None else arg.arg)
+        parts.extend([args.defaults, args.kw_defaults])
+        return parts
+
+    return all(eq(x, y) for x, y in zip(strip(a), strip(b))) and len(strip(a)) == len(strip(b))
+
+
+def split_fixture_pairs(text: str) -> list:
+    """Statements as tests/helpers.py:load_sql_fixture_pairs groups them:
+    comment lines and blank lines dropped, then split on ';'. Even entries
+    are inputs (with their # metadata), odd ones expected outputs."""
+    lines = [line for line in text.splitlines() if line and not line.startswith("--")]
+    return "\n".join(lines).split(";")
+
+
+def module_file(module: str, maps: "Maps") -> str | None:
+    base = module.replace(".", "/")
+    for rel in (base + ".py", base + "/__init__.py"):
+        if rel in maps.src_names:
+            return rel
+    return None
+
 
 def module_name(rel: str) -> str | None:
     if not rel.endswith(".py"):
@@ -925,6 +1080,9 @@ class Selector:
         self.old_trees: dict = {}
         self.changes = None
         self.pending = {"overrides": {}, "deleted": [], "need": False, "fallback": 0}
+        self.number_of = {t["id"]: t["number"] for t in tests}
+        self.exec_info: list = []
+        self.exec_ok = True
 
     def tests_under(self, prefix: str) -> int:
         bits = 0
@@ -987,6 +1145,10 @@ class Selector:
         # Patched file contents (relative path -> bytes, None if deleted), for
         # running tests on the patched tree.
         self.changes = {}
+        # Line-level Python changes (path, touched old lines, broad?) for the
+        # TPC executor check; any other kind of change disables it.
+        self.exec_info = []
+        self.exec_ok = True
         bits = 0
         for fp in patches:
             try:
@@ -999,9 +1161,114 @@ class Selector:
         if self.pending["need"]:
             bits |= self.resolve_fingerprint(reasons)
         try:
+            bits = self.exec_refine(bits, reasons)
+        except Exception as error:
+            reasons.append(f"exec check failed ({error!r}); keeping all")
+        try:
             bits = self.verify_heavy(bits, self.ms, reasons)
         except Exception as error:
             reasons.append(f"verify failed ({error!r}); keeping all")
+        return bits
+
+    def exec_refine(self, bits: int, reasons: list) -> int:
+        if not (EXEC_CHECK and EXEC_CHECK_SCRIPT.exists() and self.exec_ok and self.exec_info):
+            return bits
+        if not BUDGET.allow(6.0):
+            reasons.append("exec check skipped: time budget")
+            return bits
+        if self.pending["need"] or any(broad for _, _, broad in self.exec_info):
+            return bits
+        lines = self.maps.exec_lines
+        profile_path = self.maps.root / "exec_profile.json.gz"
+        if not lines or not profile_path.exists() or not (PRISTINE / "sqlglot").is_dir():
+            return bits
+        targets = {}
+        for test_id, key in EXEC_TESTS.items():
+            n = self.number_of.get(test_id)
+            if n is not None and bits >> n & 1 and key in lines:
+                targets[key] = n
+        opt_n = self.number_of.get(OPTIMIZED_TPCH)
+        want_opt = opt_n is not None and bool(bits >> opt_n & 1) and "tpch" in lines
+        if not targets and not want_opt:
+            return bits
+
+        def run_lines(n):
+            """Changed lines this test executes, per file."""
+            out = {}
+            for rel, touched, _ in self.exec_info:
+                shard = self.maps.shard(rel)
+                if shard is None:
+                    continue
+                mine = {ln for ln in touched if shard.executors([ln], ("f", "d")) >> n & 1}
+                if mine:
+                    out[rel] = mine
+            return out
+
+        queries = {}
+        for key, n in targets.items():
+            run = run_lines(n)
+            if not run:
+                continue
+            info = lines[key]
+            affected = set()
+            ok = True
+            for rel, mine in run.items():
+                if mine & info["D"].get(rel, set()) or not mine <= info["P"].get(rel, set()):
+                    ok = False
+                    break
+                for i, p in enumerate(info["queries"]):
+                    if mine & p.get(rel, set()):
+                        affected.add(i)
+            if ok and affected:
+                queries[key] = sorted(affected)
+        opt_ok = False
+        if want_opt:
+            run = run_lines(opt_n)
+            info = lines["tpch"]
+            opt_ok = bool(run) and all(
+                not (mine & info["D"].get(rel, set())) and mine <= info["P"].get(rel, set())
+                for rel, mine in run.items()
+            )
+        if not queries and not opt_ok:
+            return bits
+
+        request = {
+            "root": str(PRISTINE),
+            "overrides": self.pending["overrides"],
+            "deleted": self.pending["deleted"],
+            "profile": str(profile_path),
+            "queries": queries,
+            "optimized_tpch": opt_ok,
+        }
+        env = {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "SKIP_INTEGRATION": "0",
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-P", "-s", str(EXEC_CHECK_SCRIPT)],
+                input=json.dumps(request), capture_output=True, text=True,
+                timeout=EXEC_CHECK_TIMEOUT, env=env,
+            )
+            result = json.loads(proc.stdout)
+        except Exception as error:
+            reasons.append(f"exec check unavailable ({error!r})")
+            return bits
+        if not result.get("ok"):
+            reasons.append(f"exec check: {result.get('error', '')[:80]}")
+            return bits
+        for key, idx in queries.items():
+            if not result["changed"].get(key):
+                bits &= ~(1 << targets[key])
+                reasons.append(f"exec check: {key} pipeline unchanged for {len(idx)} queries -> dropped")
+            else:
+                reasons.append(f"exec check: {key} changed queries {result['changed'][key][:5]}")
+        if opt_ok and not result.get("optimized_tpch_changed"):
+            bits &= ~(1 << opt_n)
+            reasons.append("exec check: optimized_tpch duckdb SQL unchanged -> dropped")
         return bits
 
     def record_change(self, fp: FilePatch) -> None:
@@ -1036,8 +1303,11 @@ class Selector:
 
     @property
     def fp_available(self) -> bool:  # noqa: D401
-        """Fingerprint machinery present (built into the image)."""
-        return USE_FP and FP_BASELINE.exists() and (PRISTINE / "sqlglot").is_dir() and FP_SCRIPT.exists()
+        """Fingerprint machinery present (built into the image) and time left."""
+        return (
+            USE_FP and FP_BASELINE.exists() and (PRISTINE / "sqlglot").is_dir()
+            and FP_SCRIPT.exists() and BUDGET.allow(2.0)
+        )
 
     def resolve_fingerprint(self, reasons: list) -> int:
         pending = self.pending
@@ -1091,6 +1361,7 @@ class Selector:
 
     def key_tests(self, key: str, added: bool) -> int:
         module, qual, name = key.split("|", 2)
+        rel = module_file(module, self.maps)
         bits = 0
         if qual:
             if name == "__bases__":
@@ -1098,16 +1369,20 @@ class Selector:
             if key in self.maps.attrs:
                 # A data attribute: the tests that read it at run time.
                 bits |= self.maps.attr_readers(key)
-            else:
-                # Never read as data at run time: a method (rebound, new
-                # defaults) or an unused constant. Callers of that name.
-                bits |= self.maps.same_name_tests(name)
+            elif not added:
+                # Never read as data at run time: a method whose defaults or
+                # decorators changed (or an unused constant): its callers.
+                bits |= self.maps.same_name_tests(name, only_file=rel)
             if added:
-                # A new attribute may shadow one inherited from a parent.
-                bits |= self.maps.attr_readers_named(name)
+                # A new attribute or method may shadow one inherited from a
+                # parent, for the tests that use this class at all.
+                users = self.maps.class_users(module, qual)
+                inherited = self.maps.attr_readers_named(name) | self.maps.same_name_tests(name)
+                bits |= (inherited & users) if users else inherited
             return bits
-        # Module global: functions that mention it, and functions of that name.
-        return self.maps.ref_tests(name) | self.maps.same_name_tests(name)
+        # Module global: functions that read it (own module or importers), and
+        # functions of that name in the same module.
+        return self.maps.ref_tests(name, module) | self.maps.same_name_tests(name, only_file=rel)
 
     def broad(self, fp: FilePatch) -> int:
         bits = 0
@@ -1125,6 +1400,11 @@ class Selector:
         rel = fp.path
         old_rel, new_rel = fp.old_path, fp.new_path
         name = posixpath.basename(rel)
+        if not (
+            rel.startswith("sqlglot/") and rel.endswith(".py") and old_rel == new_rel
+            and not fp.is_new and not fp.is_deleted and not fp.binary
+        ):
+            self.exec_ok = False  # only in-place edits of sqlglot modules qualify
 
         # pytest config candidates at the repository root
         if "/" not in rel and name in PYTEST_CONFIG_FILES:
@@ -1178,7 +1458,31 @@ class Selector:
             return self.python_file(fp, rel, old_source, reasons)
 
         readers = self.maps.readers(rel)
+        readers = self.fixture_refine(rel, old_source, fp, readers, reasons)
         reasons.append(f"{rel}: data file, {bin(readers).count('1')} readers")
+        return readers
+
+    def fixture_refine(self, rel: str, old_source: bytes, fp: FilePatch, readers: int, reasons: list) -> int:
+        """Drop heavy readers that were measured not to depend on the part of
+        a SQL pair fixture this patch changes (tools/mapbuild/fixture_deps.py)."""
+        deps = self.maps.fixture_deps.get(rel)
+        if not deps:
+            return readers
+        old_text = old_source.decode("utf-8", "replace")
+        applied = apply_hunks(old_text, fp.hunks)
+        if applied is None:
+            return readers
+        old_parts, new_parts = split_fixture_pairs(old_text), split_fixture_pairs(applied.new_text)
+        expected_only = len(old_parts) == len(new_parts) and all(
+            i % 2 == 1 for i, (a, b) in enumerate(zip(old_parts, new_parts)) if a != b
+        )
+        for number, dep in deps.items():
+            n = int(number)
+            if not readers >> n & 1:
+                continue
+            if dep == "none" or (dep == "inputs" and expected_only):
+                readers &= ~(1 << n)
+                reasons.append(f"{rel}: test {n} does not use the changed part ({dep})")
         return readers
 
     def config_file(self, fp: FilePatch, reasons: list) -> int:
@@ -1235,6 +1539,7 @@ class Selector:
             compile(new_tree, rel, "exec", dont_inherit=True)
         except (SyntaxError, ValueError) as error:
             reasons.append(f"{rel}: no longer compiles ({type(error).__name__}) -> importers")
+            self.exec_ok = False
             return shard.importers | readers
         old_tree = self.old_tree(rel, old_source)
         module = module_name(rel)
@@ -1248,10 +1553,15 @@ class Selector:
             use_fp=importable and self.fp_available,
             same_name=self.maps.same_name_tests,
         )
+        differ.future_annotations = has_future_annotations(old_tree) and has_future_annotations(new_tree)
         differ.block(old_tree.body, new_tree.body, Scope("d", None, None))
         if differ.need_fp:
             self.pending["need"] = True
             self.pending["fallback"] |= differ.fallback
+        if rel.startswith("sqlglot/"):
+            self.exec_info.append((rel, differ.touched, differ.broad or bool(readers)))
+        else:
+            self.exec_ok = False
         return differ.tests | readers
 
 
@@ -1286,10 +1596,12 @@ def pack(numbers: list, ms: dict) -> list:
 
 
 def main() -> int:
+    global BUDGET
     tests = json.loads((DATA / "tests.json").read_text("utf-8"))["tests"]
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     valid_numbers = set(ms)
     patches = sorted((DATA / "commits").glob("*.patch"))
+    BUDGET = Budget(len(patches))
     maps = Maps(MAPS)
     selector = Selector(maps, tests)
     out = sys.stdout
@@ -1298,13 +1610,12 @@ def main() -> int:
         commit = patch_path.stem
         reasons: list = []
         try:
-            if time.monotonic() - STARTED > TIME_BUDGET:
-                raise TimeoutError("time budget spent")
             text = patch_path.read_bytes().decode("utf-8", "replace")
             bits = selector.commit(text, reasons)
         except Exception as error:
             reasons.append(f"selector failed ({error!r}); running everything")
             bits = selector.all_bits
+        BUDGET.done += 1
         chosen = []
         n = 0
         while bits:

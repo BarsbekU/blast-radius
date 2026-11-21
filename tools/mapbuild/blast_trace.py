@@ -45,8 +45,21 @@ def _install(out_dir: str) -> None:
         # Each location reports once per process; the process is one test.
         return mon.DISABLE
 
+    def on_start(code, offset):
+        # A function whose whole body sits on its `def`/`lambda` line (e.g.
+        # `exp.X: lambda *_: "VIRTUAL"` in a TRANSFORMS table) produces no
+        # LINE event at all: its only instructions are on the line where it
+        # starts. Record the start line so such calls are not invisible.
+        if code.co_filename.startswith(root):
+            seen = executed.get(code)
+            if seen is None:
+                seen = executed[code] = set()
+            seen.add(code.co_firstlineno)
+        return mon.DISABLE
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     reads: dict = {}
     listed: set = set()

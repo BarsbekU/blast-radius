@@ -30,6 +30,7 @@ spec = importlib.util.spec_from_file_location("blast_select", ROOT / "selector" 
 def load_selector(data: Path, maps: Path):
     os.environ["BLAST_DATA"] = str(data)
     os.environ["BLAST_MAPS"] = str(maps)
+    os.environ.setdefault("BLAST_TIME_BUDGET", "1000000")  # no wall-clock throttling in evaluation
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

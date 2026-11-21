@@ -95,10 +95,117 @@ def main() -> int:
                         elif isinstance(inner, ast.Attribute) and inner.attr in globals_:
                             refs[inner.attr][rel].add(inner.end_lineno or inner.lineno)
 
+    # Module-qualified references: "module||name" -> {file: [lines]}, only
+    # from the defining module itself and from files that import the name
+    # from it (or import the module and use module.name).
+    def module_of(rel: str) -> str:
+        mod = rel[:-3].replace("/", ".")
+        return mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
+
+    defined = {module_of(rel): module_level_names(tree) for rel, tree in trees.items()}
+    qualified: dict = defaultdict(lambda: defaultdict(set))
+    for rel, tree in trees.items():
+        here = module_of(rel)
+        package = here if rel.endswith("__init__.py") else here.rsplit(".", 1)[0]
+        aliases_name: dict = defaultdict(set)   # local name -> {(module, name)}
+        aliases_module: dict = defaultdict(set)  # local name -> {module}
+        for name in defined.get(here, ()):
+            aliases_name[name].add((here, name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    parts = package.split(".")
+                    parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                    base = ".".join(parts + ([base] if base else []))
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    if alias.name == "*":
+                        for name in defined.get(base, ()):
+                            aliases_name[name].add((base, name))
+                        continue
+                    aliases_name[local].add((base, alias.name))
+                    aliases_module[local].add(f"{base}.{alias.name}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases_module[alias.asname].add(alias.name)
+                    else:
+                        aliases_module[alias.name.split(".")[0]].add(alias.name.split(".")[0])
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            body = node.body if isinstance(node.body, list) else [node.body]
+            for stmt in body:
+                for inner in ast.walk(stmt):
+                    if isinstance(inner, ast.Name) and inner.id in aliases_name:
+                        for module, name in aliases_name[inner.id]:
+                            if name in defined.get(module, ()):
+                                qualified[f"{module}||{name}"][rel].add(inner.lineno)
+                    elif isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name):
+                        for module in aliases_module.get(inner.value.id, ()):
+                            if inner.attr in defined.get(module, ()):
+                                qualified[f"{module}||{inner.attr}"][rel].add(inner.end_lineno or inner.lineno)
+
+    # Globals re-exported by a star import or through a package __init__ can
+    # be read as pkg.NAME in ways the import resolution above does not
+    # follow: leave them out, so the selector falls back to every mention
+    # of the name.
+    reexported: set = set()
+    for rel, tree in trees.items():
+        here = module_of(rel)
+        package = here if rel.endswith("__init__.py") else here.rsplit(".", 1)[0]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            base = node.module or ""
+            if node.level:
+                parts = package.split(".")
+                parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                base = ".".join(parts + ([base] if base else []))
+            for alias in node.names:
+                if alias.name == "*":
+                    reexported.update((base, n) for n in defined.get(base, ()))
+                elif rel.endswith("__init__.py"):
+                    reexported.add((base, alias.name))
+    out_q = {}
+    for module, names in defined.items():
+        for name in names:
+            if (module, name) in reexported:
+                continue
+            files = qualified.get(f"{module}||{name}", {})
+            out_q[f"{module}||{name}"] = {f: sorted(l) for f, l in files.items()}
+    # `from X import N` in an ordinary module binds the same object as X.N;
+    # reads through that alias are already counted under X||N.
+    for rel, tree in trees.items():
+        if rel.endswith("__init__.py"):
+            continue
+        here = module_of(rel)
+        package = here.rsplit(".", 1)[0]
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            base = node.module or ""
+            if node.level:
+                parts = package.split(".")
+                parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                base = ".".join(parts + ([base] if base else []))
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                source = f"{base}||{alias.name}"
+                target = f"{here}||{alias.asname or alias.name}"
+                if source in out_q and target not in out_q and (here, alias.asname or alias.name) not in reexported:
+                    out_q[target] = out_q[source]
+
     os.makedirs(args.out, exist_ok=True)
     with gzip.open(os.path.join(args.out, "refs.json.gz"), "wt", compresslevel=9) as handle:
         json.dump({n: {f: sorted(l) for f, l in files.items()} for n, files in refs.items()},
                   handle, separators=(",", ":"))
+    with gzip.open(os.path.join(args.out, "qrefs.json.gz"), "wt", compresslevel=9) as handle:
+        json.dump(out_q, handle, separators=(",", ":"))
+    print(f"qualified refs for {len(out_q)} module globals ({len(reexported)} re-exported left out)")
+    print(f"qualified refs for {len(qualified)} module globals")
     with gzip.open(os.path.join(args.out, "funcs.json.gz"), "wt", compresslevel=9) as handle:
         json.dump({n: dict(files) for n, files in funcs.items()}, handle, separators=(",", ":"))
     print(f"refs for {len(refs)} module-level names; {len(funcs)} function names")
