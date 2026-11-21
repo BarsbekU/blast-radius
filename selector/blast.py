@@ -75,8 +75,8 @@ RERUN = os.environ.get("BLAST_RERUN", "1") == "1"
 RERUN_MAX_QUERIES = int(os.environ.get("BLAST_RERUN_MAX_QUERIES", "4"))
 RERUN_MAX_SECS = float(os.environ.get("BLAST_RERUN_MAX_SECS", "4"))
 RERUN_EXTRA_SEEDS = [12345]
-# Opt-in (80/20 candidate): scaled-down proxy for the 28.8 s test_max_nodes.
-PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "0") == "1"
+# Scaled-down proxy for the 28.8 s test_max_nodes (BLAST_PROXY_MAX_NODES=0 turns it off).
+PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
 MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 WORKER_MS = 2000

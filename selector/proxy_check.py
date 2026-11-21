@@ -1,5 +1,5 @@
 """Scaled-down run of tests/test_parser.py::TestParser::test_max_nodes on the
-patched package (opt-in, BLAST_PROXY_MAX_NODES=1).
+patched package (on by default; BLAST_PROXY_MAX_NODES=0 disables it).
 
 The real test parses a 10,000-wide, 100-deep expression list (about 2M AST
 nodes, ~29 s). This runs the same assertions in the same order with the

@@ -52,7 +52,7 @@ and `python -c` subprocesses the tests start. For each test it records:
    queries' outputs differ, those queries are executed on the TPC-DS data
    (`maps/data.zip`, loaded exactly as the test does) under two hash seeds
    and compared with the pristine results.
-8. Optional (`BLAST_PROXY_MAX_NODES=1`): `test_max_nodes` (29 s) is replaced
+8. `test_max_nodes` (29 s) is replaced
    by the same assertions on a 300-wide instead of 10,000-wide statement
    (`selector/proxy_check.py`) when the patch only edits sqlglot modules.
 9. The selected tests are packed over 1-8 workers (longest first onto the
