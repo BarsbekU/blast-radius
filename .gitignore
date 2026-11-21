@@ -1,0 +1,5 @@
+output.jsonl
+*.tar.gz
+__pycache__/
+.venv/
+work/
