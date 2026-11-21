@@ -89,6 +89,13 @@ def main() -> int:
         from sqlglot.optimizer import optimize
         from sqlglot.planner import Plan
         from sqlglot.schema import ensure_schema
+        # Everything tests/test_executor.py imports: a module that no longer
+        # imports there fails every test in the file.
+        from sqlglot import exp  # noqa: F401
+        from sqlglot.errors import ExecuteError  # noqa: F401
+        from sqlglot.executor import env, execute  # noqa: F401
+        from sqlglot.executor.python import Python, PythonExecutor  # noqa: F401
+        from sqlglot.executor.table import Table, ensure_tables  # noqa: F401
     except BaseException as error:  # noqa: BLE001
         json.dump({"ok": False, "error": f"import: {type(error).__name__}: {error}"[:300]}, sys.stdout)
         return 0
@@ -188,16 +195,37 @@ def main() -> int:
             qs = list(request.get("queries", {}).get(test, []))
             if sample:
                 qs.sort(key=lambda i: (costs.get(i, 99.0), i))
-            pipe_changed, truncated = [], False
+            def probe(i) -> bool:
+                """Run one query now: a difference keeps the test, and then
+                nothing else needs checking."""
+                hit = rerun_queries(dict(cfg, extra_seeds=[]), records, [i], schema_dict, transpile, h)
+                if hit:
+                    changed[test] = hit
+                    rerun_note[test] = {"tried": [i], "still": hit, "mode": "probe"}
+                return bool(hit)
+
+            if cfg and dq:
+                first = [i for i in cfg.get("must", []) if i in dq] or sorted(
+                    dq, key=lambda i: (not records[i].get("execute"), costs.get(i, 99.0), i)
+                )
+                if probe(first[0]):
+                    continue
+            pipe_changed, truncated, probed = [], False, False
             for i in qs:
                 try:
                     if not same(records[i], schema_dict):
                         pipe_changed.append(i)
                 except BaseException:  # noqa: BLE001 - an error is a change
                     pipe_changed.append(i)
+                if cfg and pipe_changed and not probed:
+                    probed = True
+                    if probe(pipe_changed[0]):
+                        break
                 if len(pipe_changed) > limit:
                     truncated = True  # more changed queries than we will run
                     break
+            if changed[test]:
+                continue  # a probe found a difference
             need = sorted(set(dq) | set(pipe_changed))
             if not need:
                 continue
@@ -215,7 +243,8 @@ def main() -> int:
                 rerun_note[test] = {"tried": need, "still": still, "mode": "all"}
                 changed[test] = still
             elif sample:
-                pick = sample_queries(need, costs, cfg)
+                executed = {i for i, rec in enumerate(records) if rec.get("execute")}
+                pick = sample_queries(need, costs, cfg, executed)
                 still = rerun_queries(dict(cfg, extra_seeds=[]), records, pick, schema_dict, transpile, h)
                 rerun_note[test] = {"tried": pick, "still": still, "mode": "sample",
                                     "of": f"{len(need)}{'+' if truncated else ''}"}
@@ -282,9 +311,14 @@ def run_one(sql, schema_dict, zf, prefix, cache):
     return h([list(result.columns), [[repr(v) for v in row] for row in result.rows]])
 
 
-def sample_queries(need, costs, cfg) -> list:
-    """The cheapest query exercising each changed data-phase line first,
-    then the cheapest others, within the sample budget."""
+def sample_queries(need, costs, cfg, executed=None) -> list:
+    """Every parse-only query (cheap and exact), then among executed ones:
+    the cheapest query exercising each changed data-phase line, the
+    cheapest others and some spread over the cost range, within budget."""
+    parse_only = []
+    if executed is not None:
+        parse_only = [i for i in need if i not in executed]
+        need = [i for i in need if i in executed]
     budget = cfg.get("sample_secs", 4.0)
     lo, hi = cfg.get("sample_min", 8), cfg.get("sample_max", 16)
     must = [i for i in cfg.get("must", []) if i in need]
@@ -310,7 +344,9 @@ def sample_queries(need, costs, cfg) -> list:
             if i not in pick and (spent + c <= budget or len(pick) < lo):
                 pick.append(i)
                 spent += c
-    return pick
+    # Executed queries first: they exercise everything a parse does and more,
+    # so a difference shows up (and stops the run) sooner.
+    return pick + parse_only
 
 
 def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list:

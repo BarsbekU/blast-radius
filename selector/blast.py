@@ -85,6 +85,10 @@ TPC_SAMPLE = os.environ.get("BLAST_TPC_SAMPLE", "1") == "1"
 TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "4.0"))
 TPC_SAMPLE_MIN = int(os.environ.get("BLAST_TPC_SAMPLE_MIN", "8"))
 TPC_SAMPLE_MAX = int(os.environ.get("BLAST_TPC_SAMPLE_MAX", "16"))
+# 70/30 rule: changes not attributable to TPC queries (import-time values,
+# broad selections, lines outside the profiled queries) are decided the same
+# way, with every query a candidate.
+TPC_BROAD_SAMPLE = os.environ.get("BLAST_TPC_BROAD_SAMPLE", "1") == "1"
 # Scaled-down proxy for the 28.8 s test_max_nodes (BLAST_PROXY_MAX_NODES=0 turns it off).
 PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
@@ -1361,9 +1365,19 @@ class Selector:
         if not BUDGET.allow(6.0):
             reasons.append("exec check skipped: time budget")
             return bits
+        # Changes the line-level analysis cannot attribute to particular TPC
+        # queries: import-time value changes, broad selections. With
+        # TPC_BROAD_SAMPLE they are decided by running queries with the
+        # whole patched package (parse checks for all, a sample executed).
+        unattributed = False
         if self.pending["need"] and not getattr(self, "fp_only_functions", False):
-            return bits
+            unattributed = True
         if any(broad for _, _, broad in self.exec_info):
+            unattributed = True
+        if unattributed and not TPC_BROAD_SAMPLE:
+            return bits
+        if unattributed and any(m.startswith("sqlglot.executor") for m in self.pending["overrides"]):
+            # The tests' class setup loads data through the executor.
             return bits
         lines = self.maps.exec_lines
         profile_path = self.maps.root / "exec_profile.json.gz"
@@ -1407,12 +1421,27 @@ class Selector:
             costs = {int(k): v for k, v in costs_all.get(key, {}).items()}
             affected, affected_d, first = set(), set(), []
             ok = True
+            if unattributed:
+                if key == "tpcds" and not data_ok:
+                    continue
+                queries[key] = []
+                data_queries[key] = list(range(len(info["queries"])))
+                must[key] = []
+                continue
             for rel, mine in run.items():
                 all_p, all_d = info["P"].get(rel, set()), info["D"].get(rel, set())
                 in_d = mine & all_d
-                # A line the test runs outside every query's pipeline and data
-                # phase (class setup, harness): no basis to decide.
-                if not mine <= (all_p | all_d) or (in_d and not data_ok):
+                if not mine <= (all_p | all_d):
+                    # A line the test runs outside every profiled query
+                    # (setup, harness, a path the profile did not take).
+                    if TPC_BROAD_SAMPLE and data_ok and key == "tpcds":
+                        affected = set()
+                        affected_d = set(range(len(info["queries"])))
+                        first = []
+                        break
+                    ok = False
+                    break
+                if in_d and not data_ok:
                     ok = False
                     break
                 for i, p in enumerate(info["queries"]):
@@ -1438,6 +1467,10 @@ class Selector:
                 not (mine & info["D"].get(rel, set())) and mine <= info["P"].get(rel, set())
                 for rel, mine in run.items()
             )
+            if unattributed:
+                # The test compares duckdb results of transpiled SQL only; the
+                # check recomputes every query's duckdb SQL: exact.
+                opt_ok = True
         if not queries and not opt_ok:
             return bits
 
@@ -1451,12 +1484,12 @@ class Selector:
             "optimized_tpch": opt_ok,
         }
         data_zip = self.maps.root / "data.zip"
-        rerun_ok = RERUN and "tpcds" in queries and data_zip.exists() and costs_all
+        rerun_ok = RERUN and bool(queries) and data_zip.exists() and costs_all
         if rerun_ok and BUDGET.allow(6.0 + 2 * RERUN_MAX_SECS + TPC_SAMPLE_SECS):
-            request["rerun"] = {"tpcds": {
+            request["rerun"] = {key: {
                 "data": str(data_zip),
-                "prefix": "tests/fixtures/optimizer/tpc-ds/",
-                "costs": costs_all.get("tpcds", {}),
+                "prefix": f"tests/fixtures/optimizer/{'tpc-ds' if key == 'tpcds' else 'tpc-h'}/",
+                "costs": costs_all.get(key, {}),
                 "max_queries": RERUN_MAX_QUERIES,
                 "max_secs": RERUN_MAX_SECS,
                 "extra_seeds": RERUN_EXTRA_SEEDS,
@@ -1464,12 +1497,12 @@ class Selector:
                 "sample_secs": TPC_SAMPLE_SECS,
                 "sample_min": TPC_SAMPLE_MIN,
                 "sample_max": TPC_SAMPLE_MAX,
-                "must": must.get("tpcds", []),
+                "must": must.get(key, []),
                 "root": str(PRISTINE),
                 "overrides": self.pending["overrides"],
                 "deleted": self.pending["deleted"],
                 "timeout": 30,
-            }}
+            } for key in queries}
         elif data_queries:
             # Data-phase changes can only be decided by re-running.
             for key in data_queries:
