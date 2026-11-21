@@ -51,7 +51,14 @@ and `python -c` subprocesses the tests start. For each test it records:
    pipeline outputs are recomputed with the patched code. If a few
    queries' outputs differ, those queries are executed on the TPC-DS data
    (`maps/data.zip`, loaded exactly as the test does) under two hash seeds
-   and compared with the pristine results.
+   and compared with the pristine results. Changed data-phase lines (the
+   executor's row processing) send the queries that run them straight to
+   execution. When more queries are affected than fit the budget, a
+   sample is executed instead (the cheapest query running each changed
+   line, then queries spread over the cost range, ~4 s); the test is
+   dropped only if every sampled result matches. This is the one place the
+   selector trades certainty for time: a change whose effect shows only in
+   unsampled queries would be missed.
 8. `test_max_nodes` (29 s) is replaced
    by the same assertions on a 300-wide instead of 10,000-wide statement
    (`selector/proxy_check.py`) when the patch only edits sqlglot modules.

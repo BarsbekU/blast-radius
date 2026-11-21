@@ -75,6 +75,16 @@ RERUN = os.environ.get("BLAST_RERUN", "1") == "1"
 RERUN_MAX_QUERIES = int(os.environ.get("BLAST_RERUN_MAX_QUERIES", "4"))
 RERUN_MAX_SECS = float(os.environ.get("BLAST_RERUN_MAX_SECS", "4"))
 RERUN_EXTRA_SEEDS = [12345]
+# Data-phase executor changes: re-run the queries that execute the changed
+# lines (exact when they fit the budget above).
+TPC_DATA_RERUN = os.environ.get("BLAST_TPC_DATA_RERUN", "1") == "1"
+# 70/30 rule: when too many tpcds queries are affected to re-run them all,
+# re-run a sample (the cheapest query exercising each changed data-phase
+# line, then the cheapest others) and drop the test if every one matches.
+TPC_SAMPLE = os.environ.get("BLAST_TPC_SAMPLE", "1") == "1"
+TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "4.0"))
+TPC_SAMPLE_MIN = int(os.environ.get("BLAST_TPC_SAMPLE_MIN", "8"))
+TPC_SAMPLE_MAX = int(os.environ.get("BLAST_TPC_SAMPLE_MAX", "16"))
 # Scaled-down proxy for the 28.8 s test_max_nodes (BLAST_PROXY_MAX_NODES=0 turns it off).
 PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
@@ -291,6 +301,7 @@ class Maps:
             out = {}
             for test, records in raw.items():
                 queries = []
+                queries_d = []
                 union_p: dict = {}
                 union_d: dict = {}
                 for rec in records:
@@ -301,7 +312,8 @@ class Maps:
                     for f, l in d.items():
                         union_d.setdefault(f, set()).update(l)
                     queries.append(p)
-                out[test] = {"queries": queries, "P": union_p, "D": union_d}
+                    queries_d.append(d)
+                out[test] = {"queries": queries, "queries_d": queries_d, "P": union_p, "D": union_d}
             self._exec_lines = out
         return self._exec_lines
 
@@ -1381,23 +1393,43 @@ class Selector:
                     out[rel] = mine
             return out
 
-        queries = {}
+        costs_path = self.maps.root / "exec_costs.json"
+        costs_all = json.loads(costs_path.read_text()) if costs_path.exists() else {}
+        queries, data_queries, must = {}, {}, {}
         for key, n in targets.items():
             run = run_lines(n)
             if not run:
                 continue
             info = lines[key]
-            affected = set()
+            # Data-phase lines are only handled by re-running queries (tpcds,
+            # the one TPC test whose queries execute in Python).
+            data_ok = TPC_DATA_RERUN and RERUN and key == "tpcds"
+            costs = {int(k): v for k, v in costs_all.get(key, {}).items()}
+            affected, affected_d, first = set(), set(), []
             ok = True
             for rel, mine in run.items():
-                if mine & info["D"].get(rel, set()) or not mine <= info["P"].get(rel, set()):
+                all_p, all_d = info["P"].get(rel, set()), info["D"].get(rel, set())
+                in_d = mine & all_d
+                # A line the test runs outside every query's pipeline and data
+                # phase (class setup, harness): no basis to decide.
+                if not mine <= (all_p | all_d) or (in_d and not data_ok):
                     ok = False
                     break
                 for i, p in enumerate(info["queries"]):
                     if mine & p.get(rel, set()):
                         affected.add(i)
-            if ok and affected:
-                queries[key] = sorted(affected)
+                    if in_d and in_d & info["queries_d"][i].get(rel, set()):
+                        affected_d.add(i)
+                for ln in in_d:
+                    # Cheapest query exercising each changed data-phase line.
+                    runs = [i for i, d in enumerate(info["queries_d"]) if ln in d.get(rel, set())]
+                    if runs:
+                        first.append(min(runs, key=lambda i: (costs.get(i, 99.0), i)))
+            if ok and (affected or affected_d):
+                queries[key] = sorted(affected - affected_d)
+                if affected_d:
+                    data_queries[key] = sorted(affected_d)
+                    must[key] = sorted(set(first))
         opt_ok = False
         if want_opt:
             run = run_lines(opt_n)
@@ -1415,23 +1447,37 @@ class Selector:
             "deleted": self.pending["deleted"],
             "profile": str(profile_path),
             "queries": queries,
+            "data_queries": data_queries,
             "optimized_tpch": opt_ok,
         }
         data_zip = self.maps.root / "data.zip"
-        costs_path = self.maps.root / "exec_costs.json"
-        if RERUN and "tpcds" in queries and data_zip.exists() and costs_path.exists() and BUDGET.allow(6.0 + 2 * RERUN_MAX_SECS):
+        rerun_ok = RERUN and "tpcds" in queries and data_zip.exists() and costs_all
+        if rerun_ok and BUDGET.allow(6.0 + 2 * RERUN_MAX_SECS + TPC_SAMPLE_SECS):
             request["rerun"] = {"tpcds": {
                 "data": str(data_zip),
                 "prefix": "tests/fixtures/optimizer/tpc-ds/",
-                "costs": json.loads(costs_path.read_text()).get("tpcds", {}),
+                "costs": costs_all.get("tpcds", {}),
                 "max_queries": RERUN_MAX_QUERIES,
                 "max_secs": RERUN_MAX_SECS,
                 "extra_seeds": RERUN_EXTRA_SEEDS,
+                "sample": TPC_SAMPLE,
+                "sample_secs": TPC_SAMPLE_SECS,
+                "sample_min": TPC_SAMPLE_MIN,
+                "sample_max": TPC_SAMPLE_MAX,
+                "must": must.get("tpcds", []),
                 "root": str(PRISTINE),
                 "overrides": self.pending["overrides"],
                 "deleted": self.pending["deleted"],
                 "timeout": 30,
             }}
+        elif data_queries:
+            # Data-phase changes can only be decided by re-running.
+            for key in data_queries:
+                queries.pop(key, None)
+            data_queries.clear()
+            request["queries"], request["data_queries"] = queries, data_queries
+            if not queries and not opt_ok:
+                return bits
         env = {
             "PYTHONHASHSEED": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -1453,11 +1499,16 @@ class Selector:
             reasons.append(f"exec check: {result.get('error', '')[:80]}")
             return bits
         for key, note in (result.get("rerun") or {}).items():
-            reasons.append(f"exec check: {key} re-ran queries {note['tried']}, still different {note['still']}")
+            reasons.append(
+                f"exec check: {key} re-ran ({note.get('mode', 'all')}"
+                + (f" of {note['of']}" if "of" in note else "")
+                + f") queries {note['tried']}, still different {note['still']}"
+            )
         for key, idx in queries.items():
             if not result["changed"].get(key):
                 bits &= ~(1 << targets[key])
-                reasons.append(f"exec check: {key} pipeline unchanged for {len(idx)} queries -> dropped")
+                nd = len(data_queries.get(key, []))
+                reasons.append(f"exec check: {key} unchanged ({len(idx)} pipeline, {nd} data-phase queries) -> dropped")
             else:
                 reasons.append(f"exec check: {key} changed queries {result['changed'][key][:5]}")
         if opt_ok and not result.get("optimized_tpch_changed"):

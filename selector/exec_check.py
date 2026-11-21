@@ -167,6 +167,7 @@ def main() -> int:
         return True
 
     rerun = request.get("rerun") or {}
+    data_queries = request.get("data_queries") or {}
     changed = {"tpch": [], "tpcds": []}
     rerun_note = {}
     try:
@@ -174,26 +175,53 @@ def main() -> int:
             records = profile[test]
             schema_dict = profile["schemas"][test]
             cfg = rerun.get(test)
-            limit = cfg["max_queries"] if cfg else 0
-            for i in request.get("queries", {}).get(test, []):
+            costs = {int(k): v for k, v in cfg.get("costs", {}).items()} if cfg else {}
+            for i, rec in enumerate(records):
+                if not rec.get("execute"):
+                    costs.setdefault(i, 0.02)  # parsed and pickled only
+            sample = bool(cfg and cfg.get("sample"))
+            limit = (max(cfg["max_queries"], cfg.get("sample_max", 0)) if sample else cfg["max_queries"]) if cfg else 0
+            # Queries running changed data-phase lines must be re-run; the
+            # others ran changed pipeline lines only, and are re-run only if
+            # a pipeline output differs.
+            dq = sorted(data_queries.get(test, []))
+            qs = list(request.get("queries", {}).get(test, []))
+            if sample:
+                qs.sort(key=lambda i: (costs.get(i, 99.0), i))
+            pipe_changed, truncated = [], False
+            for i in qs:
                 try:
                     if not same(records[i], schema_dict):
-                        changed[test].append(i)
+                        pipe_changed.append(i)
                 except BaseException:  # noqa: BLE001 - an error is a change
-                    changed[test].append(i)
-                if len(changed[test]) > limit:
-                    break  # too many changed queries to re-run: keep the test
-            costs = cfg.get("costs", {}) if cfg else {}
-            est = sum(costs.get(str(i), 99.0) for i in changed[test])
-            if cfg and changed[test] and len(changed[test]) <= limit and est <= cfg["max_secs"]:
-                # The pipeline output of a few queries changed. Run them for
-                # real with the patched package and compare with the
-                # pristine results (rerun.py); identical result and duckdb
-                # SQL under every seed tried mean the comparison the test
-                # makes is unchanged.
-                still = rerun_queries(cfg, records, changed[test], schema_dict, transpile, h)
-                rerun_note[test] = {"tried": list(changed[test]), "still": still}
+                    pipe_changed.append(i)
+                if len(pipe_changed) > limit:
+                    truncated = True  # more changed queries than we will run
+                    break
+            need = sorted(set(dq) | set(pipe_changed))
+            if not need:
+                continue
+            if not cfg:
+                changed[test] = need
+                continue
+            est = sum(costs.get(i, 99.0) for i in need)
+            if not truncated and len(need) <= cfg["max_queries"] and est <= cfg["max_secs"]:
+                # Every affected query whose output may differ is run for
+                # real with the patched package and compared with the
+                # pristine result; identical results and duckdb SQL under
+                # every seed tried mean the comparisons the test makes are
+                # unchanged.
+                still = rerun_queries(cfg, records, need, schema_dict, transpile, h)
+                rerun_note[test] = {"tried": need, "still": still, "mode": "all"}
                 changed[test] = still
+            elif sample:
+                pick = sample_queries(need, costs, cfg)
+                still = rerun_queries(dict(cfg, extra_seeds=[]), records, pick, schema_dict, transpile, h)
+                rerun_note[test] = {"tried": pick, "still": still, "mode": "sample",
+                                    "of": f"{len(need)}{'+' if truncated else ''}"}
+                changed[test] = still
+            else:
+                changed[test] = need
         optimized_changed = False
         if request.get("optimized_tpch"):
             for rec in profile["tpch"]:
@@ -254,6 +282,37 @@ def run_one(sql, schema_dict, zf, prefix, cache):
     return h([list(result.columns), [[repr(v) for v in row] for row in result.rows]])
 
 
+def sample_queries(need, costs, cfg) -> list:
+    """The cheapest query exercising each changed data-phase line first,
+    then the cheapest others, within the sample budget."""
+    budget = cfg.get("sample_secs", 4.0)
+    lo, hi = cfg.get("sample_min", 8), cfg.get("sample_max", 16)
+    must = [i for i in cfg.get("must", []) if i in need]
+    rest = sorted((i for i in need if i not in must), key=lambda i: (costs.get(i, 99.0), i))
+    pick, spent = list(must), sum(costs.get(i, 99.0) for i in must)
+    # Half the budget on the cheapest queries...
+    for i in rest:
+        c = costs.get(i, 99.0)
+        if len(pick) >= hi or (len(pick) >= lo // 2 and spent + c > budget / 2):
+            break
+        pick.append(i)
+        spent += c
+    # ...the rest spread over the remaining cost range (bigger queries
+    # touch more rows and more edge cases).
+    remaining = [i for i in rest if i not in pick]
+    slots = hi - len(pick)
+    if remaining and slots > 0:
+        step = max(1, len(remaining) // slots)
+        for i in remaining[step - 1::step] + remaining:
+            if len(pick) >= hi:
+                break
+            c = costs.get(i, 99.0)
+            if i not in pick and (spent + c <= budget or len(pick) < lo):
+                pick.append(i)
+                spent += c
+    return pick
+
+
 def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list:
     """Indices whose result (or duckdb SQL) differs, or that error; checked
     in this process (PYTHONHASHSEED=0) and again in a child per extra seed."""
@@ -265,7 +324,13 @@ def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list
         for i in indices:
             rec = records[i]
             try:
-                if not rec.get("execute") or "result" not in rec:
+                if not rec.get("execute"):
+                    # The test only parses these in the parent and pickles them
+                    # to a worker that returns None: only an exception counts.
+                    from sqlglot import parse_one
+
+                    pickle.loads(pickle.dumps(parse_one(rec["sql"])))
+                elif "result" not in rec:
                     still.append(i)
                 elif hasher(transpile(rec["sql"], write="duckdb")[0]) != rec.get("duck"):
                     still.append(i)
@@ -273,6 +338,10 @@ def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list
                     still.append(i)
             except BaseException:  # noqa: BLE001 - an error is a change
                 still.append(i)
+            if still:
+                # One differing query keeps the test; the rest would only
+                # cost CPU time.
+                return sorted(still)
     ok = [i for i in indices if i not in still]
     for seed in cfg.get("extra_seeds", []):
         if not ok:
@@ -281,7 +350,7 @@ def rerun_queries(cfg, records, indices, schema_dict, transpile, hasher) -> list
 
         child = {"mode": "rerun_only", "root": cfg["root"], "overrides": cfg["overrides"],
                  "deleted": cfg["deleted"], "data": cfg["data"], "prefix": cfg["prefix"],
-                 "schema": schema_dict, "queries": [[i, records[i]["sql"], records[i]["result"]] for i in ok]}
+                 "schema": schema_dict, "queries": [[i, records[i]["sql"], records[i]["result"]] for i in ok if records[i].get("execute")]}
         env = dict(os.environ, PYTHONHASHSEED=str(seed))
         try:
             proc = subprocess.run([sys.executable, "-P", "-s", os.path.abspath(__file__)],
@@ -314,6 +383,8 @@ def rerun_only(request) -> int:
                     bad.append(i)
             except BaseException:  # noqa: BLE001
                 bad.append(i)
+            if bad:
+                break
     json.dump({"bad": bad}, sys.stdout)
     return 0
 
