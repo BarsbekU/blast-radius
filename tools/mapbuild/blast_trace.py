@@ -69,28 +69,49 @@ def _install(out_dir: str) -> None:
         path = normpath(path)
         return path if path.startswith(root) else None
 
+    import sysconfig
+
+    stdlib = sysconfig.get_paths()["stdlib"].rstrip("/") + "/"
+
+    def caller_kind(frame) -> str:
+        """Who asked: the nearest caller that is not a stdlib helper (io,
+        pathlib, gzip, pkgutil...). The import system and pytest's own
+        machinery (config, assertion rewriting) are not data dependencies."""
+        depth = 0
+        while frame is not None and depth < 40:
+            name = frame.f_code.co_filename
+            if name.startswith("<frozen importlib") or name.startswith("<frozen zipimport"):
+                return "import"
+            if name.startswith(stdlib) and "/site-packages/" not in name:
+                if name.endswith("/linecache.py"):
+                    return "linecache"
+                frame = frame.f_back
+                depth += 1
+                continue
+            if name.startswith("<frozen"):
+                frame = frame.f_back
+                depth += 1
+                continue
+            if "/_pytest/" in name or "/pluggy/" in name:
+                return "pytest"
+            return "data"
+        return "data"
+
     def audit(event, args):
         if event == "open":
             path = resolve(args[0])
             if path is None:
                 return
             mode = args[1] if len(args) > 1 else None
-            kind = "data"
             if isinstance(mode, str) and any(c in mode for c in "wax+"):
                 kind = "write"
             else:
-                frame = getframe(1)
-                depth = 0
-                while frame is not None and depth < 16:
-                    name = frame.f_code.co_filename
-                    if name.startswith("<frozen importlib") or name.endswith("/importlib/__init__.py"):
-                        kind = "import"
-                        break
-                    if name.endswith("/linecache.py"):
-                        kind = "linecache"
-                        break
-                    frame = frame.f_back
-                    depth += 1
+                kind = caller_kind(getframe(1))
+                if kind == "pytest":
+                    # pytest reading its config files or rewriting a test
+                    # module it imports: config files are handled specially
+                    # by the selector, imports by the coverage maps.
+                    kind = "pytest"
             kinds = reads.get(path)
             if kinds is None:
                 kinds = reads[path] = set()
@@ -99,17 +120,11 @@ def _install(out_dir: str) -> None:
             path = resolve(args[0] if args else ".")
             if path is None:
                 return
-            # The import system lists every package directory it searches;
-            # only listings made by other code (pkgutil, glob, tests) count.
-            frame = getframe(1)
-            depth = 0
-            while frame is not None and depth < 16:
-                name = frame.f_code.co_filename
-                if name.startswith("<frozen importlib") or "/_pytest/" in name or "/pluggy/" in name:
-                    return
-                frame = frame.f_back
-                depth += 1
-            listed.add(path)
+            # The import system lists every package directory it searches
+            # and pytest lists the test tree; only listings made by other
+            # code (pkgutil in a test, glob, sqlglot itself) count.
+            if caller_kind(getframe(1)) == "data":
+                listed.add(path)
         elif event == "import":
             # Raised for every import of a module not yet in sys.modules,
             # including attempts that fail (e.g. optional modules).

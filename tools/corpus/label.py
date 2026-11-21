@@ -82,9 +82,16 @@ def main() -> int:
     parser.add_argument("--hang", type=int, default=1800, help="per commit")
     parser.add_argument("--work", type=Path, default=Path("/work"))
     parser.add_argument("--only", default="")
+    parser.add_argument(
+        "--prune", choices=("none", "heavy", "all"), default="none",
+        help="skip tests (heavy: only those >= 2.5 s) that, run alone, never imported "
+             "a changed module nor read a changed file",
+    )
     args = parser.parse_args()
 
     blast = load_blast(args.repo)
+    maps = blast.Maps(args.repo / "selector" / "maps") if args.prune != "none" else None
+    prune_min = 2.5 if args.prune == "heavy" else 0.0
     tests = json.loads(args.tests.read_text())["tests"]
     number = {t["id"]: t["number"] for t in tests}
     by_file: dict = {}
@@ -123,6 +130,35 @@ def main() -> int:
             (labels / f"{commit}.json").write_text(json.dumps(result))
             shutil.rmtree(workdir, ignore_errors=True)
             return
+        deselect: list = []
+        pruned: list = []
+        targets = ["tests"]
+        if maps is not None:
+            touched = 0
+            text = patch.read_text("utf-8")
+            for fp in blast.parse_patch(text):
+                for rel in {fp.old_path, fp.new_path} - {None}:
+                    shard = maps.shard(rel)
+                    if shard is not None:
+                        touched |= shard.importers | shard.readers
+                    touched |= maps.readers(rel)
+                    if "/" not in rel or rel.endswith("conftest.py"):
+                        touched = -1  # config-ish: keep everything
+            if touched != -1:
+                for t in tests:
+                    if t["seconds"] >= prune_min and not (touched >> t["number"] & 1):
+                        deselect += ["--deselect", t["id"]]
+                        pruned.append(t["number"])
+                if args.prune == "all":
+                    # Name the remaining tests instead of collecting the tree.
+                    keep = [t["id"] for t in tests if touched >> t["number"] & 1]
+                    targets = keep if keep else []
+                    deselect = []
+                    if not keep:
+                        result.update(status="ok", failing=[], secs=0.0, pruned=pruned, exitstatus=5)
+                        (labels / f"{commit}.json").write_text(json.dumps(result))
+                        shutil.rmtree(workdir, ignore_errors=True)
+                        return
         out_json = workdir / "_label.json"
         env = {k: v for k, v in os.environ.items() if not k.startswith("BLAST_TRACE")}
         env.update(
@@ -137,7 +173,7 @@ def main() -> int:
             proc = subprocess.run(
                 [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-p", "blast_label_plugin",
                  "-q", "--no-header", "-o", "addopts=", "--continue-on-collection-errors",
-                 f"--timeout={args.timeout}", "tests"],
+                 f"--timeout={args.timeout}", *deselect, *targets],
                 cwd=workdir, env=env, capture_output=True, text=True, timeout=args.hang,
             )
             status = "ok"
@@ -160,7 +196,7 @@ def main() -> int:
             result["exitstatus"] = data["exitstatus"]
         elif status == "ok":
             status = "no_report"
-        result.update(status=status, failing=sorted(failing), secs=round(secs, 1))
+        result.update(status=status, failing=sorted(failing), secs=round(secs, 1), pruned=pruned)
         if status != "ok":
             result["tail"] = tail
         (labels / f"{commit}.json").write_text(json.dumps(result))

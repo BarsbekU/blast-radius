@@ -44,11 +44,19 @@ HERE = Path(__file__).resolve().parent
 MAPS = Path(os.environ.get("BLAST_MAPS", str(HERE / "maps")))
 # Pristine sqlglot (importable, precompiled) and its attribute fingerprints,
 # both prepared when the image is built (see Dockerfile).
-PRISTINE = Path(os.environ.get("BLAST_PRISTINE", str(HERE / "pristine")))
+PRISTINE = Path(os.environ.get("BLAST_PRISTINE", str(HERE / "tree")))
 FP_BASELINE = Path(os.environ.get("BLAST_FP_BASELINE", str(HERE / "fp_baseline.json.gz")))
 FP_SCRIPT = HERE / "fingerprint.py"
 FP_TIMEOUT = float(os.environ.get("BLAST_FP_TIMEOUT", "40"))
 USE_FP = os.environ.get("BLAST_USE_FP", "1") == "1"
+# Proxy verification: when a selection holds heavy tests, run its cheap
+# tests on the patched tree first and keep the heavy ones only if a cheap
+# covering test fails (see Selector.verify_heavy).
+VERIFY = os.environ.get("BLAST_VERIFY", "0") == "1"
+VERIFY_TREE = Path(os.environ.get("BLAST_VERIFY_TREE", str(HERE / "tree")))
+HEAVY_MS = int(float(os.environ.get("BLAST_HEAVY_SECONDS", "2.5")) * 1000)
+VERIFY_MIN_PROXIES = int(os.environ.get("BLAST_VERIFY_MIN_PROXIES", "1"))
+VERIFY_TIMEOUT = float(os.environ.get("BLAST_VERIFY_TIMEOUT", "60"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "150"))  # seconds for the batch
@@ -906,11 +914,17 @@ class Selector:
         self.tests = tests
         self.all_bits = 0
         self.by_file: dict = {}
+        self.id_of: dict = {}
+        self.ms: dict = {}
         for t in tests:
             self.all_bits |= 1 << t["number"]
             self.by_file.setdefault(t["file"], 0)
             self.by_file[t["file"]] |= 1 << t["number"]
+            self.id_of[t["number"]] = t["id"]
+            self.ms[t["number"]] = int(t["seconds"] * 1000 + 0.5)
         self.old_trees: dict = {}
+        self.changes = None
+        self.pending = {"overrides": {}, "deleted": [], "need": False, "fallback": 0}
 
     def tests_under(self, prefix: str) -> int:
         bits = 0
@@ -925,6 +939,43 @@ class Selector:
             tree = self.old_trees[rel] = ast.parse(source, filename=rel)
         return tree
 
+    def verify_heavy(self, bits: int, ms: dict, reasons: list) -> int:
+        """Run the cheap selected tests on the patched tree; drop the heavy
+        ones when every cheap test covering the change passes."""
+        if not (VERIFY and VERIFY_TREE.is_dir() and self.changes is not None):
+            return bits
+        chosen = [n for n in ms if bits >> n & 1]
+        heavy = [n for n in chosen if ms[n] >= HEAVY_MS]
+        cheap = [n for n in chosen if ms[n] < HEAVY_MS]
+        if not heavy or len(cheap) < VERIFY_MIN_PROXIES:
+            return bits
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import verify  # noqa: E402  (only needed here)
+
+        ids = {self.id_of[n]: n for n in cheap}
+        result = verify.run(str(VERIFY_TREE), self.changes, sorted(ids), VERIFY_TIMEOUT)
+        if not result["ok"]:
+            reasons.append(f"verify: could not run ({result.get('why', '')[:60]}); keeping all")
+            return bits
+        failed = {ids[i] for i in result["failed"] if i in ids}
+        unknown = [i for i in result["failed"] if i not in ids]
+        if unknown:
+            # e.g. a whole test file failed to collect: count every cheap
+            # test of that file as failing.
+            for i in unknown:
+                for n in cheap:
+                    if self.id_of[n].startswith(i):
+                        failed.add(n)
+        reasons.append(f"verify: {len(cheap)} cheap tests, {len(failed)} failed, "
+                       f"{result['secs']:.1f}s")
+        if failed:
+            out = 0
+            for n in failed | set(heavy):
+                out |= 1 << n
+            return out
+        return 0
+
     def commit(self, patch_text: str, reasons: list) -> int:
         patches = parse_patch(patch_text)
         if not patches:
@@ -933,19 +984,59 @@ class Selector:
         # Import-time changes are collected over the whole commit, then
         # resolved by one fingerprint run of the patched package.
         self.pending = {"overrides": {}, "deleted": [], "need": False, "fallback": 0}
+        # Patched file contents (relative path -> bytes, None if deleted), for
+        # running tests on the patched tree.
+        self.changes = {}
         bits = 0
         for fp in patches:
             try:
+                self.record_change(fp)
                 bits |= self.file(fp, reasons)
             except Exception as error:  # never lose a commit to a bug here
                 reasons.append(f"{fp.path}: analysis failed ({error!r}); broad fallback")
                 bits |= self.broad(fp)
+                self.changes = None
         if self.pending["need"]:
             bits |= self.resolve_fingerprint(reasons)
+        try:
+            bits = self.verify_heavy(bits, self.ms, reasons)
+        except Exception as error:
+            reasons.append(f"verify failed ({error!r}); keeping all")
         return bits
 
+    def record_change(self, fp: FilePatch) -> None:
+        """Keep the patched content of every file, for verification runs."""
+        if self.changes is None:
+            return
+        if fp.binary:
+            self.changes = None
+            return
+        old_rel, new_rel = fp.old_path, fp.new_path
+        if fp.is_deleted:
+            self.changes[old_rel or fp.path] = None
+            return
+        if old_rel and new_rel and old_rel != new_rel:
+            self.changes[old_rel] = None
+        if fp.is_new:
+            text = "".join(t + "\n" for h in fp.hunks for tag, t in h.lines if tag == "+")
+            self.changes[new_rel or fp.path] = text.encode("utf-8")
+            return
+        source = self.maps.source(old_rel or fp.path)
+        if source is None:
+            self.changes = None
+            return
+        if not fp.hunks:
+            self.changes[new_rel or fp.path] = source
+            return
+        applied = apply_hunks(source.decode("utf-8", "surrogateescape"), fp.hunks)
+        if applied is None:
+            self.changes = None
+            return
+        self.changes[new_rel or fp.path] = applied.new_text.encode("utf-8", "surrogateescape")
+
     @property
-    def fp_available(self) -> bool:
+    def fp_available(self) -> bool:  # noqa: D401
+        """Fingerprint machinery present (built into the image)."""
         return USE_FP and FP_BASELINE.exists() and (PRISTINE / "sqlglot").is_dir() and FP_SCRIPT.exists()
 
     def resolve_fingerprint(self, reasons: list) -> int:

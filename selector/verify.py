@@ -118,6 +118,7 @@ def run(pristine: str, changes: dict, node_ids: list, timeout: float, per_test_t
         # exit status 0 = all passed, 1 = some failed; anything else is unusual
         ok = data["exitstatus"] in (0, 1)
         return {"ok": ok, "failed": failed, "secs": time.monotonic() - started,
-                "why": "" if ok else f"exit status {data['exitstatus']}"}
+                "why": "" if ok else f"exit status {data['exitstatus']}",
+                "tail": proc.stdout[-4000:]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
