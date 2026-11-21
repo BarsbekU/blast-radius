@@ -47,7 +47,11 @@ and `python -c` subprocesses the tests start. For each test it records:
    (`selector/fingerprint.py`). Comparing with the pristine fingerprints
    gives the exact values that changed, including ones derived elsewhere
    (metaclasses, `__init_subclass__`, subclasses extending a parent's
-   table). The tests that read those values are selected.
+   table). The tests that read those values are selected. For a table
+   whose existing entries only changed value, a test that read the table
+   but never looked up a changed entry or iterated the table (in the
+   key-tracking trace) used only its truth value, length or identity,
+   which did not change, and is not selected.
 5. Fixtures and other data files select the tests that read them; pytest
    config files select everything only if pytest's settings change or the
    file stops parsing.

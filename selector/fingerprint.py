@@ -372,6 +372,7 @@ def main() -> int:
     # For changed tables: exactly which entries differ (added, removed or
     # with a different value).
     entries = {}
+    value_only = []
     for k in changed:
         if k in TABLES:
             ELEMENTS[k] = table_elements(fingerprinter, TABLES[k])
@@ -379,9 +380,14 @@ def main() -> int:
         if old is None or new is None:
             continue
         entries[k] = sorted(e for e in set(old) | set(new) if old.get(e) != new.get(e))
+        if entries[k] and all(e in old and e in new for e in entries[k]):
+            # Same keys, different values: emptiness, length and membership
+            # of the table are unchanged.
+            value_only.append(k)
     json.dump(
         {"ok": True, "changed": changed, "added": added, "removed": removed, "failed": newly_failed,
-         "functions": sorted(k for k in changed + added if k in callables), "entries": entries},
+         "functions": sorted(k for k in changed + added if k in callables), "entries": entries,
+         "value_only": value_only},
         sys.stdout,
     )
     return 0

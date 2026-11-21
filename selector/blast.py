@@ -93,6 +93,9 @@ TPC_BROAD_SAMPLE = os.environ.get("BLAST_TPC_BROAD_SAMPLE", "1") == "1"
 # literals compared against), keep only the tests for which some recorded
 # evaluation would come out differently.
 CMP_REFINE = os.environ.get("BLAST_CMP_REFINE", "1") == "1"
+# A table whose existing entries only changed value: readers that never
+# looked those entries up (in the key-tracking run) cannot see it.
+VALUE_ONLY_TABLES = os.environ.get("BLAST_VALUE_ONLY_TABLES", "1") == "1"
 # Scaled-down proxy for the 28.8 s test_max_nodes (BLAST_PROXY_MAX_NODES=0 turns it off).
 PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
@@ -276,11 +279,13 @@ class Maps:
             self._akeys = self._load("akeys.json.gz")
         return self._akeys
 
-    def table_readers(self, key: str, entries) -> int:
+    def table_readers(self, key: str, entries, value_only: bool = False) -> int:
         """Readers of a class attribute; narrowed to the changed entries of a
         table when the per-key map covers it. A reader with no per-key record
         for the table (read it in another trace, or only took its length)
-        stays selected."""
+        stays selected, unless only values of existing entries changed and
+        it read the table in the key-tracking run: then it used only the
+        table object (truth value, length, identity), which is unchanged."""
         readers = self.attr_readers(key)
         table = self.akeys.get(key) if entries else None
         if not table:
@@ -292,7 +297,26 @@ class Maps:
         for entry in entries:
             if entry in table:
                 bits |= decode(table[entry])
-        return bits | (readers & ~keyed)
+        unknown = readers & ~keyed
+        if value_only and VALUE_ONLY_TABLES:
+            seen = self.akeys_seen.get(key)
+            if seen is not None:
+                unknown &= ~seen
+        return bits | unknown
+
+    @property
+    def akeys_seen(self) -> dict:
+        """Per tracked table, the tests that read it in the key-tracking run
+        (tools/mapbuild/seen_tables.py)."""
+        if not hasattr(self, "_akeys_seen"):
+            self._akeys_seen = {}
+            path = self.root / "akeys_seen.json.gz"
+            if path.exists():
+                with gzip.open(path, "rt") as handle:
+                    raw = json.load(handle)
+                sets = [int(s, 16) for s in raw["sets"]]
+                self._akeys_seen = {tag: sets[i] for tag, i in raw["tables"].items()}
+        return self._akeys_seen
 
     def attr_readers_named(self, name: str) -> int:
         self.attrs  # noqa: B018 - load
@@ -1532,6 +1556,7 @@ class Selector:
         self.exec_ok = True
         self.fp_only_functions = False
         self.fp_entries = {}
+        self.fp_value_only = set()
         bits = 0
         for fp in patches:
             try:
@@ -1851,6 +1876,7 @@ class Selector:
             return bits
         bits = 0
         self.fp_entries = result.get("entries", {})
+        self.fp_value_only = set(result.get("value_only", []))
         changed_keys = set(result.get("changed", [])) | set(result.get("added", []))
         # Only functions rebound or given new defaults/decorators: their
         # effect flows through calls, which the TPC exec check re-runs.
@@ -1889,7 +1915,8 @@ class Selector:
                 # a table whose changed entries are known, those that looked
                 # up one of them or used the whole table.
                 entries = getattr(self, "fp_entries", {}).get(key)
-                bits |= self.maps.table_readers(key, entries)
+                value_only = key in getattr(self, "fp_value_only", set())
+                bits |= self.maps.table_readers(key, entries, value_only)
             elif not added:
                 # Never read as data at run time: a method whose defaults or
                 # decorators changed (or an unused constant): its callers.
