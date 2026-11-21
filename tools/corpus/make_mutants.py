@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Generate synthetic commits against sqlglot at the pinned commit.
+
+The sample commits are single-token edits (operator flips, constants, index
+shifts), inserted comment lines, typos in SQL fixtures, and mixes of those.
+This generator makes the same kinds plus a few the sample does not show, so
+the selector is tested on change kinds it was not tuned for.
+
+    python tools/corpus/make_mutants.py --src work/sqlglot --out work/corpus --count 300 --seed 1
+
+Writes <out>/commits/<id>.patch and <out>/kinds.json ({id: kind}). Labels
+(which tests fail) come from tools/corpus/label.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import io
+import json
+import os
+import random
+import re
+import string
+import tokenize
+from pathlib import Path
+
+COMMENTS = [
+    "# Cheap check first",
+    "# Kept for backwards compatibility",
+    "# Intentionally not cached",
+    "# Mirrors the behavior of the reference implementation",
+    "# Keep in sync with the generator",
+    "# TODO: revisit once the parser supports this",
+    "# Order matters here",
+    "# See the dialect docs for details",
+    "# noqa: E501",
+    "# type: ignore",
+]
+
+SWAPS = {
+    "==": ["!="], "!=": ["=="], "<": ["<=", ">"], "<=": ["<", ">="], ">": [">=", "<"],
+    ">=": [">", "<="], "+": ["-"], "-": ["+"], "*": ["//"], "//": ["*"],
+    "and": ["or"], "or": ["and"], "True": ["False"], "False": ["True"],
+    "is": ["is not", "=="], "in": ["not in"], "break": ["continue"], "continue": ["break"],
+    "+=": ["-="], "-=": ["+="], "%": ["//"], "None": ["0"],
+}
+
+ALPHABET = string.ascii_letters + string.digits + " ,()=<>'.*"
+
+
+def unified(rel: str, old: str, new: str) -> str:
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    body = "".join(
+        difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{rel}", tofile=f"b/{rel}", n=3)
+    )
+    if not body:
+        return ""
+    return f"diff --git a/{rel} b/{rel}\nindex 0000000..1111111 100644\n" + body
+
+
+def docstring_lines(source: str) -> set:
+    import ast
+
+    lines: set = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return lines
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):
+                lines.update(range(body[0].lineno, body[0].end_lineno + 1))
+    return lines
+
+
+def token_mutation(source: str, rng: random.Random):
+    """One token-level edit; returns (new_source, description) or None."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    doc = docstring_lines(source)
+    lines = source.splitlines(keepends=True)
+    candidates = []
+    for i, tok in enumerate(tokens):
+        if tok.start[0] in doc:
+            continue
+        if tok.type == tokenize.OP and tok.string in SWAPS:
+            candidates.append((i, "swap"))
+        elif tok.type == tokenize.NAME and tok.string in SWAPS:
+            candidates.append((i, "swap"))
+        elif tok.type == tokenize.NUMBER:
+            candidates.append((i, "number"))
+        elif tok.type == tokenize.STRING and len(tok.string) < 40 and not tok.string.startswith(("f", "rf", "fr", "b", "rb", "F")) and tok.string.count("\n") == 0:
+            candidates.append((i, "string"))
+        elif tok.type == tokenize.NAME and tok.string in ("if", "while", "elif") and i + 1 < len(tokens):
+            candidates.append((i, "not"))
+    if not candidates:
+        return None
+    i, how = rng.choice(candidates)
+    tok = tokens[i]
+    (row, col), (erow, ecol) = tok.start, tok.end
+    if row != erow:
+        return None
+    line = lines[row - 1]
+    if how == "swap":
+        replacement = rng.choice(SWAPS[tok.string])
+        if tok.string == "is" and i + 1 < len(tokens) and tokens[i + 1].string == "not":
+            return None
+        if tok.string == "in" and i > 0 and tokens[i - 1].string == "not":
+            return None
+        new_line = line[:col] + replacement + line[ecol:]
+    elif how == "number":
+        text = tok.string
+        try:
+            value = int(text, 0)
+            new_text = str(value + rng.choice([1, -1])) if value != 0 else "1"
+        except ValueError:
+            try:
+                value = float(text)
+                new_text = repr(value * 2 if value else 1.0)
+            except ValueError:
+                return None
+        new_line = line[:col] + new_text + line[ecol:]
+    elif how == "string":
+        text = tok.string
+        quote_start = text.index(text[-1])
+        inner = text[quote_start + 1:-1]
+        if not inner:
+            inner_new = "x"
+        else:
+            k = rng.randrange(len(inner) + 1)
+            choice = rng.choice(["insert", "delete", "case"])
+            if choice == "delete" and len(inner) > 1:
+                k = min(k, len(inner) - 1)
+                inner_new = inner[:k] + inner[k + 1:]
+            elif choice == "case" and inner.lower() != inner.upper():
+                inner_new = inner.swapcase()
+            else:
+                inner_new = inner[:k] + rng.choice(string.ascii_uppercase) + inner[k:]
+        if "\\" in inner_new[-1:]:
+            return None
+        new_line = line[:col] + text[: quote_start + 1] + inner_new + text[-1] + line[ecol:]
+    else:  # insert not after if/while/elif
+        nxt = tokens[i + 1]
+        if nxt.start[0] != row:
+            return None
+        if nxt.string == "not":
+            end = tokens[i + 2].start[1] if i + 2 < len(tokens) and tokens[i + 2].start[0] == row else None
+            if end is None:
+                return None
+            new_line = line[: nxt.start[1]] + line[end:]
+        else:
+            new_line = line[: nxt.start[1]] + "not " + line[nxt.start[1]:]
+    if new_line == line:
+        return None
+    lines[row - 1] = new_line
+    return "".join(lines), f"{how} {tok.string!r} line {row}"
+
+
+def comment_insertion(source: str, rng: random.Random):
+    lines = source.splitlines(keepends=True)
+    if len(lines) < 3:
+        return None
+    for _ in range(20):
+        k = rng.randrange(1, len(lines))
+        nxt = lines[k]
+        if not nxt.strip():
+            continue
+        indent = nxt[: len(nxt) - len(nxt.lstrip())]
+        comment = indent + rng.choice(COMMENTS) + "\n"
+        new = lines[:k] + [comment] + lines[k:]
+        return "".join(new), f"comment before line {k + 1}"
+    return None
+
+
+def fixture_typo(text: str, rng: random.Random):
+    lines = text.splitlines(keepends=True)
+    candidates = [i for i, l in enumerate(lines) if l.strip()]
+    if not candidates:
+        return None
+    k = rng.choice(candidates)
+    line = lines[k].rstrip("\n")
+    choice = rng.choice(["insert", "delete", "swap", "token", "replace"])
+    pos = rng.randrange(len(line) + 1)
+    if choice == "delete" and line:
+        pos = min(pos, len(line) - 1)
+        new = line[:pos] + line[pos + 1:]
+    elif choice == "swap" and len(line) > 2:
+        pos = min(pos, len(line) - 2)
+        new = line[:pos] + line[pos + 1] + line[pos] + line[pos + 2:]
+    elif choice == "token":
+        spaces = [m.start() for m in re.finditer(" ", line)] or [len(line)]
+        p = rng.choice(spaces)
+        new = line[:p] + " " + rng.choice(["x", "1", "a", "NULL", "AS", "("]) + line[p:]
+    elif choice == "replace" and line:
+        pos = min(pos, len(line) - 1)
+        new = line[:pos] + rng.choice(ALPHABET) + line[pos + 1:]
+    else:
+        new = line[:pos] + rng.choice(ALPHABET) + line[pos:]
+    if new == line:
+        return None
+    lines[k] = new + "\n"
+    return "".join(lines), f"typo line {k + 1}"
+
+
+def docstring_edit(source: str, rng: random.Random):
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    docs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.Module)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):
+                docs.append(body[0])
+    if not docs:
+        return None
+    d = rng.choice(docs)
+    lines = source.splitlines(keepends=True)
+    rows = [r for r in range(d.lineno - 1, d.end_lineno) if re.search(r"[A-Za-z]{3,}", lines[r])]
+    if not rows:
+        return None
+    row = rng.choice(rows)
+    line = lines[row]
+    w = rng.choice(re.findall(r"[A-Za-z]{3,}", line))
+    lines[row] = line.replace(w, w + "s", 1)
+    return "".join(lines), f"docstring line {row + 1}"
+
+
+def line_edit(source: str, rng: random.Random, how: str):
+    lines = source.splitlines(keepends=True)
+    code = [i for i, l in enumerate(lines) if l.strip() and not l.strip().startswith("#")]
+    if len(code) < 3:
+        return None
+    k = rng.choice(code[1:-1])
+    if how == "delete":
+        new = lines[:k] + lines[k + 1:]
+    elif how == "duplicate":
+        new = lines[: k + 1] + [lines[k]] + lines[k + 1:]
+    else:  # swap with next line
+        new = lines[:k] + [lines[k + 1], lines[k]] + lines[k + 2:]
+    return "".join(new), f"{how} line {k + 1}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--count", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--prefix", default="m")
+    args = parser.parse_args()
+    rng = random.Random(args.seed)
+
+    src = args.src
+    py_files = sorted(str(p.relative_to(src)).replace(os.sep, "/") for p in (src / "sqlglot").rglob("*.py"))
+    test_files = sorted(str(p.relative_to(src)).replace(os.sep, "/") for p in (src / "tests").rglob("test_*.py"))
+    fixtures = sorted(
+        str(p.relative_to(src)).replace(os.sep, "/")
+        for p in (src / "tests" / "fixtures").rglob("*")
+        if p.is_file() and p.suffix in (".sql", ".json", ".csv") and p.stat().st_size < 2_000_000
+    )
+    sizes = {f: (src / f).stat().st_size for f in py_files}
+
+    def read(rel):
+        return (src / rel).read_text("utf-8")
+
+    def pick_py(files=None):
+        files = files or py_files
+        weights = [sizes.get(f, 1000) ** 0.7 for f in files]
+        return rng.choices(files, weights)[0]
+
+    def one(kind: str):
+        """Return list of (rel, old, new) edits for a commit of this kind."""
+        if kind == "code":
+            rel = pick_py()
+            r = token_mutation(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "comment":
+            rel = pick_py()
+            r = comment_insertion(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "fixture":
+            rel = rng.choice(fixtures)
+            r = fixture_typo(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "test":
+            rel = rng.choice(test_files)
+            r = token_mutation(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "docstring":
+            rel = pick_py()
+            r = docstring_edit(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind in ("delete", "duplicate", "swapline"):
+            rel = pick_py()
+            r = line_edit(read(rel), rng, {"swapline": "swap"}.get(kind, kind))
+            return [(rel, r)] if r else None
+        if kind == "multi":
+            parts = []
+            used = set()
+            for sub in rng.sample(["code", "comment", "fixture", "comment", "code"], rng.choice([2, 3])):
+                edit = one(sub)
+                if edit and edit[0][0] not in used:
+                    used.add(edit[0][0])
+                    parts.extend(edit)
+            return parts if len(parts) >= 2 else None
+        if kind == "docs":
+            rel = rng.choice(["README.md", "CHANGELOG.md", "CONTRIBUTING.md"])
+            text = read(rel)
+            lines = text.splitlines(keepends=True)
+            k = rng.randrange(len(lines))
+            lines.insert(k, "Updated wording for clarity.\n")
+            return [(rel, ("".join(lines), "docs line"))]
+        if kind == "config":
+            rel = rng.choice(["setup.cfg", "pyproject.toml"])
+            text = read(rel)
+            lines = text.splitlines(keepends=True)
+            k = rng.randrange(len(lines))
+            lines.insert(k, "# maintained by the release script\n")
+            return [(rel, ("".join(lines), "config comment"))]
+        raise ValueError(kind)
+
+    kinds_plan = (
+        ["code"] * 52 + ["comment"] * 10 + ["fixture"] * 14 + ["multi"] * 10
+        + ["test"] * 5 + ["docstring"] * 3 + ["delete"] * 2 + ["duplicate"] * 1
+        + ["swapline"] * 1 + ["docs"] * 1 + ["config"] * 1
+    )
+    (args.out / "commits").mkdir(parents=True, exist_ok=True)
+    kinds: dict = {}
+    made = 0
+    attempts = 0
+    while made < args.count and attempts < args.count * 50:
+        attempts += 1
+        kind = rng.choice(kinds_plan)
+        try:
+            edits = one(kind)
+        except Exception:
+            edits = None
+        if not edits:
+            continue
+        patch = ""
+        desc = []
+        for rel, (new, what) in edits:
+            old = read(rel)
+            if new == old:
+                patch = ""
+                break
+            patch += unified(rel, old, new)
+            desc.append(f"{rel}: {what}")
+        if not patch:
+            continue
+        commit = f"{args.prefix}{made:04d}"
+        (args.out / "commits" / f"{commit}.patch").write_text(patch, "utf-8", newline="\n")
+        kinds[commit] = {"kind": kind, "what": desc}
+        made += 1
+    (args.out / "kinds.json").write_text(json.dumps(kinds, indent=1), "utf-8")
+    print(f"made {made} commits in {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

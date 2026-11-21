@@ -1,0 +1,8 @@
+.git
+.venv
+output.jsonl
+*.tar.gz
+**/__pycache__
+work/*
+!work/sqlglot
+work/sqlglot/.git
