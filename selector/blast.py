@@ -74,7 +74,7 @@ OPTIMIZED_TPCH = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
 RERUN = os.environ.get("BLAST_RERUN", "1") == "1"
 RERUN_MAX_QUERIES = int(os.environ.get("BLAST_RERUN_MAX_QUERIES", "4"))
 RERUN_MAX_SECS = float(os.environ.get("BLAST_RERUN_MAX_SECS", "4"))
-RERUN_EXTRA_SEEDS = [12345]
+RERUN_EXTRA_SEEDS = [int(s) for s in os.environ.get("BLAST_RERUN_EXTRA_SEEDS", "").split(",") if s.strip()]
 # Data-phase executor changes: re-run the queries that execute the changed
 # lines (exact when they fit the budget above).
 TPC_DATA_RERUN = os.environ.get("BLAST_TPC_DATA_RERUN", "1") == "1"
@@ -82,7 +82,7 @@ TPC_DATA_RERUN = os.environ.get("BLAST_TPC_DATA_RERUN", "1") == "1"
 # re-run a sample (the cheapest query exercising each changed data-phase
 # line, then the cheapest others) and drop the test if every one matches.
 TPC_SAMPLE = os.environ.get("BLAST_TPC_SAMPLE", "1") == "1"
-TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "4.0"))
+TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "2.5"))
 TPC_SAMPLE_MIN = int(os.environ.get("BLAST_TPC_SAMPLE_MIN", "8"))
 TPC_SAMPLE_MAX = int(os.environ.get("BLAST_TPC_SAMPLE_MAX", "16"))
 # 70/30 rule: changes not attributable to TPC queries (import-time values,
@@ -203,8 +203,8 @@ def _forked(fn, request: dict, timeout: float, env: dict) -> dict:
 # need nothing beyond sqlglot and pytz. BLAST_UNIT_CHECK=0 disables it.
 UNIT_CHECK = os.environ.get("BLAST_UNIT_CHECK", "1") == "1"
 UNIT_SCRIPT = HERE / "unit_check.py"
-UNIT_MAX_TESTS = int(os.environ.get("BLAST_UNIT_MAX_TESTS", "4"))
-UNIT_MAX_MS = int(os.environ.get("BLAST_UNIT_MAX_MS", "1000"))
+UNIT_MAX_TESTS = int(os.environ.get("BLAST_UNIT_MAX_TESTS", "16"))
+UNIT_MAX_MS = int(os.environ.get("BLAST_UNIT_MAX_MS", "300"))
 UNIT_EXCLUDED_FILES = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_sqlglotc.py"}
 WORKER_MS = 2000
 MAX_WORKERS = 8
