@@ -106,6 +106,106 @@ MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 # testers (maps/rtcov.json.gz) and leave the import-time effects to the
 # fingerprint. BLAST_RT_SPLIT=0 turns it off.
 RT_SPLIT = os.environ.get("BLAST_RT_SPLIT", "1") == "1"
+# Checks (fingerprint, TPC re-run, proxies) run forked from the selector:
+# the interpreter, the check modules and the pristine data they load are
+# already in memory, so a check pays only for importing the patched package
+# and its own work. Needs the same PYTHONHASHSEED as the checks (run.py
+# re-executes with 0); otherwise, or with BLAST_FORK=0, a subprocess.
+FORK_CHECKS = os.environ.get("BLAST_FORK", "1") == "1" and hasattr(os, "fork")
+_CHECK_MODULES: dict = {}
+
+
+def _check_module(script: Path):
+    module = _CHECK_MODULES.get(script.stem)
+    if module is None:
+        import importlib
+
+        if str(script.parent) not in sys.path:
+            sys.path.insert(0, str(script.parent))
+        module = _CHECK_MODULES[script.stem] = importlib.import_module(script.stem)
+    return module
+
+
+def run_check(script: Path, request: dict, timeout: float, env: dict) -> dict:
+    if FORK_CHECKS and os.environ.get("PYTHONHASHSEED") == env.get("PYTHONHASHSEED", "0"):
+        import unittest  # noqa: F401  (sqlglot's test-mode checks, inherited by the child)
+
+        module = _check_module(script)
+        if hasattr(module, "warm"):
+            module.warm(request)
+        return _forked(module.run, request, timeout, env)
+    proc = subprocess.run(
+        [sys.executable, "-P", "-s", str(script)],
+        input=json.dumps(request), capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    return json.loads(proc.stdout)
+
+
+def _forked(fn, request: dict, timeout: float, env: dict) -> dict:
+    import select
+    import signal
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # the check: never returns
+        status = 0
+        try:
+            os.close(r)
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):  # nothing it prints may reach the answers
+                os.dup2(devnull, fd)
+            os.environ.update(env)
+            sys.dont_write_bytecode = True
+            try:
+                result = fn(request)
+            except BaseException as error:  # noqa: BLE001
+                result = {"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}
+            view = memoryview(json.dumps(result).encode())
+            while view:
+                view = view[os.write(w, view):]
+        except BaseException:  # noqa: BLE001
+            status = 1
+        finally:
+            os._exit(status)
+    os.close(w)
+    chunks = []
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"check timed out after {timeout}s")
+            ready, _, _ = select.select([r], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(r, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except BaseException:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        os.close(r)
+        raise
+    os.close(r)
+    os.waitpid(pid, 0)
+    return json.loads(b"".join(chunks))
+
+
+# Small selections of cheap tests are run on the patched package (forked,
+# selector/unit_check.py) and the tests that pass are dropped. Only for
+# commits that edit sqlglot modules in place, and only tests in files that
+# need nothing beyond sqlglot and pytz. BLAST_UNIT_CHECK=0 disables it.
+UNIT_CHECK = os.environ.get("BLAST_UNIT_CHECK", "1") == "1"
+UNIT_SCRIPT = HERE / "unit_check.py"
+UNIT_MAX_TESTS = 4
+UNIT_MAX_MS = 1000
+UNIT_EXCLUDED_FILES = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_sqlglotc.py"}
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "0"))  # 0: derive from batch size
@@ -462,6 +562,35 @@ class Maps:
                 # Reads made while modules import show up in the fingerprint.
                 bits |= shard.runtime_executors(lines)
         return bits
+
+    def local_name_users(self, rel: str | None, name: str) -> int:
+        """Tests that ran a line, inside a function of this module, that
+        mentions `name` (as a variable): the readers of a module global of
+        that name, however it was bound (assignment, def, class, import)."""
+        if not rel:
+            return 0
+        cache = self.__dict__.setdefault("_name_lines", {})
+        lines_by_name = cache.get(rel)
+        if lines_by_name is None:
+            lines_by_name = {}
+            source = self.source(rel)
+            if source is not None:
+                try:
+                    tree = ast.parse(source)
+                except (SyntaxError, ValueError):
+                    tree = None
+                for node in ast.walk(tree) if tree is not None else ():
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        continue
+                    body = node.body if isinstance(node.body, list) else [node.body]
+                    for stmt in body:
+                        for inner in ast.walk(stmt):
+                            if isinstance(inner, ast.Name):
+                                lines_by_name.setdefault(inner.id, set()).add(inner.lineno)
+            cache[rel] = lines_by_name
+        lines = lines_by_name.get(name)
+        shard = self.shard(rel) if lines else None
+        return shard.runtime_executors(sorted(lines)) if shard is not None else 0
 
     def same_name_tests(self, name: str, only_file: str | None = None, runtime: bool = False) -> int:
         """Tests that called any function or method called `name` (with
@@ -1567,6 +1696,8 @@ class Selector:
         self.changes = None
         self.pending = {"overrides": {}, "deleted": [], "need": False, "fallback": 0}
         self.number_of = {t["id"]: t["number"] for t in tests}
+        self.id_of = {t["number"]: t["id"] for t in tests}
+        self.file_of = {t["number"]: t["id"].split("::")[0] for t in tests}
         self.exec_info: list = []
         self.exec_ok = True
 
@@ -1638,6 +1769,7 @@ class Selector:
         self.fp_only_functions = False
         self.fp_entries = {}
         self.fp_value_only = set()
+        self.unit_ok = True
         bits = 0
         # Tests selected by files under tests/ (fixtures, test modules): the
         # TPC re-run and proxies judge only sqlglot code, so these stay
@@ -1668,7 +1800,55 @@ class Selector:
             bits = self.verify_heavy(bits, self.ms, reasons)
         except Exception as error:
             reasons.append(f"verify failed ({error!r}); keeping all")
+        try:
+            bits = self.unit_refine(bits, reasons)
+        except Exception as error:
+            reasons.append(f"unit check failed ({error!r}); keeping all")
         return bits | pinned
+
+    def unit_refine(self, bits: int, reasons: list) -> int:
+        """Run a small selection of cheap tests on the patched package and
+        drop the ones that pass (see UNIT_CHECK)."""
+        if not (UNIT_CHECK and bits and self.unit_ok and self.changes is not None):
+            return bits
+        chosen = [n for n in self.ms if bits >> n & 1]
+        if not 1 <= len(chosen) <= UNIT_MAX_TESTS or sum(self.ms[n] for n in chosen) > UNIT_MAX_MS:
+            return bits
+        if any(self.file_of.get(n) in UNIT_EXCLUDED_FILES for n in chosen):
+            return bits
+        markers = ("no longer", "does not import", "broad", "analysis failed", "unavailable", "skipped")
+        if any(m in r for r in reasons for m in markers):
+            return bits
+        # Every changed module must be importable patched (else the run
+        # would test the pristine code).
+        for rel in self.changes:
+            module = module_name(rel)
+            if not module or module not in self.pending["overrides"]:
+                return bits
+        if not UNIT_SCRIPT.exists() or not (PRISTINE / "tests").is_dir() or not BUDGET.allow(2.0):
+            return bits
+        request = {
+            "root": str(PRISTINE), "overrides": self.pending["overrides"], "deleted": self.pending["deleted"],
+            "tests": [self.id_of[n] for n in chosen],
+        }
+        env = {
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "SKIP_INTEGRATION": "0",
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        }
+        try:
+            result = run_check(UNIT_SCRIPT, request, 20, env)
+        except Exception as error:
+            reasons.append(f"unit check unavailable ({error!r})")
+            return bits
+        passed = set(result.get("passed", [])) if result.get("ok") else set()
+        dropped = [n for n in chosen if self.id_of[n] in passed]
+        for n in dropped:
+            bits &= ~(1 << n)
+        reasons.append(f"unit check: {len(dropped)} of {len(chosen)} selected tests pass on the patched code -> dropped")
+        return bits
 
     def proxy_refine(self, bits: int, reasons: list) -> int:
         """Opt-in: replace test_max_nodes by a scaled-down run of its body
@@ -1690,11 +1870,7 @@ class Selector:
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         }
         try:
-            proc = subprocess.run(
-                [sys.executable, "-P", "-s", str(PROXY_SCRIPT)],
-                input=json.dumps(request), capture_output=True, text=True, timeout=20, env=env,
-            )
-            result = json.loads(proc.stdout)
+            result = run_check(PROXY_SCRIPT, request, 20, env)
         except Exception as error:
             reasons.append(f"proxy check unavailable ({error!r})")
             return bits
@@ -1771,10 +1947,10 @@ class Selector:
             if unattributed:
                 if key == "tpcds" and not data_ok:
                     continue
-                # Every query's pipeline (parse ... codegen, duckdb SQL) is
-                # compared; the ones that differ are re-run for real, and a
-                # sample of the rest is executed.
-                queries[key] = list(range(len(info["queries"])))
+                # Every query's duckdb SQL is compared (cheap and exact for
+                # the duckdb side of the test), and a sample of the queries
+                # is executed.
+                queries[key] = []
                 data_queries[key] = list(range(len(info["queries"])))
                 must[key] = []
                 continue
@@ -1870,12 +2046,7 @@ class Selector:
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         }
         try:
-            proc = subprocess.run(
-                [sys.executable, "-P", "-s", str(EXEC_CHECK_SCRIPT)],
-                input=json.dumps(request), capture_output=True, text=True,
-                timeout=EXEC_CHECK_TIMEOUT, env=env,
-            )
-            result = json.loads(proc.stdout)
+            result = run_check(EXEC_CHECK_SCRIPT, request, EXEC_CHECK_TIMEOUT, env)
         except Exception as error:
             reasons.append(f"exec check unavailable ({error!r})")
             return bits
@@ -1953,12 +2124,7 @@ class Selector:
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         }
         try:
-            proc = subprocess.run(
-                [sys.executable, "-P", "-s", str(FP_SCRIPT)],
-                input=json.dumps(request), capture_output=True, text=True,
-                timeout=FP_TIMEOUT, env=env,
-            )
-            result = json.loads(proc.stdout)
+            result = run_check(FP_SCRIPT, request, FP_TIMEOUT, env)
         except Exception as error:
             reasons.append(f"fingerprint unavailable ({error!r}); import-time fallback")
             return pending["fallback"]
@@ -2023,8 +2189,15 @@ class Selector:
                 bits |= (inherited & users) if users else inherited
             return bits
         # Module global: functions that read it (own module or importers), and
-        # functions of that name in the same module.
-        return self.maps.ref_tests(name, module) | self.maps.same_name_tests(name, only_file=rel, runtime=True)
+        # functions of that name in the same module. The reference maps index
+        # only names assigned at module level, so also take every line of this
+        # module's own functions that uses the name: a removed or rebound
+        # import (`from x import Scope`) is read there and nowhere else.
+        return (
+            self.maps.ref_tests(name, module)
+            | self.maps.same_name_tests(name, only_file=rel, runtime=True)
+            | self.maps.local_name_users(rel, name)
+        )
 
     def broad(self, fp: FilePatch) -> int:
         bits = 0
@@ -2042,10 +2215,13 @@ class Selector:
         rel = fp.path
         old_rel, new_rel = fp.old_path, fp.new_path
         name = posixpath.basename(rel)
-        if not (
+        in_place = (
             rel.startswith("sqlglot/") and rel.endswith(".py") and old_rel == new_rel
             and not fp.is_new and not fp.is_deleted and not fp.binary
-        ) and not is_test_side(fp):
+        )
+        if not in_place:
+            self.unit_ok = False
+        if not in_place and not is_test_side(fp):
             self.exec_ok = False  # only in-place edits of sqlglot modules qualify
 
         # pytest config candidates at the repository root

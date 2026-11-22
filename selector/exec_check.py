@@ -71,10 +71,34 @@ def step_fingerprint(plan, serde) -> str:
     return h(rows)
 
 
+_PROFILES: dict = {}
+
+
+def load_profile(path: str) -> dict:
+    """The pristine pipeline profile, parsed once per process (a forked
+    check inherits it from the selector)."""
+    profile = _PROFILES.get(path)
+    if profile is None:
+        with gzip.open(path, "rt") as handle:
+            profile = _PROFILES[path] = json.load(handle)
+    return profile
+
+
+def warm(request: dict) -> None:
+    """Load the pristine profile in the selector before forking a check."""
+    if request.get("profile"):
+        load_profile(request["profile"])
+
+
 def main() -> int:
     request = json.load(sys.stdin)
     if request.get("mode") == "rerun_only":
         return rerun_only(request)
+    json.dump(run(request), sys.stdout)
+    return 0
+
+
+def run(request: dict) -> dict:
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
     from fingerprint import _Finder  # noqa: E402
@@ -100,11 +124,9 @@ def main() -> int:
         from sqlglot.executor.python import Python, PythonExecutor  # noqa: F401
         from sqlglot.executor.table import Table, ensure_tables  # noqa: F401
     except BaseException as error:  # noqa: BLE001
-        json.dump({"ok": False, "error": f"import: {type(error).__name__}: {error}"[:300]}, sys.stdout)
-        return 0
+        return {"ok": False, "error": f"import: {type(error).__name__}: {error}"[:300]}
 
-    with gzip.open(request["profile"], "rt") as handle:
-        profile = json.load(handle)
+    profile = load_profile(request["profile"])
     store = profile.get("store", {})
     parsed: dict = {}
     loaded: dict = {}
@@ -207,6 +229,25 @@ def main() -> int:
                     rerun_note[test] = {"tried": [i], "still": hit, "mode": "probe"}
                 return bool(hit)
 
+            if cfg and request.get("unattributed"):
+                # Whole-package changes: the duckdb SQL of every executed
+                # query must be unchanged (an import-time table change in a
+                # generator can alter it for queries the sample skips).
+                duck_bad = []
+                for i, rec in enumerate(records):
+                    if not rec.get("execute") or "duck" not in rec:
+                        continue
+                    try:
+                        if h(transpile(rec["sql"], write="duckdb")[0]) != rec["duck"]:
+                            duck_bad.append(i)
+                    except BaseException:  # noqa: BLE001 - an error is a change
+                        duck_bad.append(i)
+                    if duck_bad:
+                        break
+                if duck_bad:
+                    changed[test] = duck_bad
+                    rerun_note[test] = {"tried": [], "still": duck_bad, "mode": "duckdb SQL"}
+                    continue
             if cfg and dq:
                 first = [i for i in cfg.get("must", []) if i in dq] or sorted(
                     dq, key=lambda i: (not records[i].get("execute"), costs.get(i, 99.0), i)
@@ -279,11 +320,9 @@ def main() -> int:
                     optimized_changed = True
                     break
     except BaseException as error:  # noqa: BLE001
-        json.dump({"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}, sys.stdout)
-        return 0
-    json.dump({"ok": True, "changed": changed, "optimized_tpch_changed": optimized_changed,
-               "rerun": rerun_note}, sys.stdout)
-    return 0
+        return {"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}
+    return {"ok": True, "changed": changed, "optimized_tpch_changed": optimized_changed,
+            "rerun": rerun_note}
 
 
 def load_table(zf, member, columns, Table):

@@ -93,8 +93,11 @@ class Fingerprinter:
             return digest(t.__name__, repr(v))
         key = id(v)
         cached = self.memo.get(key)
-        if cached is not None:
-            return cached
+        # The memo keeps each object alive: an id is only reused after its
+        # object is freed, and a reused id must never return another
+        # object's fingerprint (that made results depend on memory layout).
+        if cached is not None and cached[0] is v:
+            return cached[1]
         if key in self.active:
             return "cycle"
         if depth > 60:
@@ -104,7 +107,7 @@ class Fingerprinter:
             result = self._value(v, t, depth + 1)
         finally:
             self.active.discard(key)
-        self.memo[key] = result
+        self.memo[key] = (v, result)
         return result
 
     def _value(self, v, t, depth: int) -> str:
@@ -186,6 +189,19 @@ ELEMENTS: dict = {}  # "mod|Qual|ATTR" -> {key id: fingerprint of the entry}
 TABLES: dict = {}  # "mod|Qual|ATTR" -> the table, for computing ELEMENTS on demand
 
 
+def tables_elements(fingerprinter: "Fingerprinter", values: list) -> dict:
+    """table_elements over every table stored under one key (classes made by
+    metaclasses can share a module and qualname), merged per entry so the
+    result does not depend on the order the classes were visited in."""
+    if len(values) == 1:
+        return table_elements(fingerprinter, values[0])
+    merged: dict = {}
+    for value in values:
+        for kid, fp in table_elements(fingerprinter, value).items():
+            merged.setdefault(kid, []).append(fp)
+    return {kid: fps[0] if len(fps) == 1 else digest("multi", *sorted(fps)) for kid, fps in merged.items()}
+
+
 def table_elements(fingerprinter: "Fingerprinter", value) -> dict:
     """Per-entry fingerprints of a dict/set table, so a change can be
     narrowed to the entries that differ."""
@@ -200,12 +216,28 @@ def table_elements(fingerprinter: "Fingerprinter", value) -> dict:
 
 
 def collect(fingerprinter: Fingerprinter) -> dict:
+    # Classes a metaclass made and dropped stay in type.__subclasses__ until
+    # the cyclic garbage collector frees them, and when it last ran depends
+    # on the process's history: only live classes may be fingerprinted.
+    import gc
+
+    gc.collect()
     out: dict = {}
     seen_classes: set = set()
+    # Distinct classes can share "module|qualname" (e.g. the Tokenizer
+    # subclasses a metaclass makes for each dialect). Their values are
+    # combined independently of the order the classes are visited in, which
+    # follows the interpreter's class list and so varies between processes.
+    multi: dict = {}
+
+    def put(key: str, fp: str) -> None:
+        if key in out:
+            multi.setdefault(key, [out[key]]).append(fp)
+        out[key] = fp
 
     def elements(key: str, name: str, value) -> None:
         if name.isupper() and type(value) in (dict, set, frozenset):
-            TABLES[key] = value
+            TABLES.setdefault(key, []).append(value)
 
     def visit_class(cls, module: str) -> None:
         if id(cls) in seen_classes:
@@ -222,17 +254,17 @@ def collect(fingerprinter: Fingerprinter) -> dict:
                 inner_module = value.__dict__.get("__module__")
                 if inner_module == module or (isinstance(inner_module, str) and inner_module.startswith("sqlglot")):
                     visit_class(value, inner_module)
-                out[f"{module}|{qual}|{name}"] = fingerprinter.value(value)
+                put(f"{module}|{qual}|{name}", fingerprinter.value(value))
                 continue
             try:
-                out[f"{module}|{qual}|{name}"] = fingerprinter.value(value)
+                put(f"{module}|{qual}|{name}", fingerprinter.value(value))
                 elements(f"{module}|{qual}|{name}", name, value)
             except Exception as error:  # pragma: no cover - be robust
-                out[f"{module}|{qual}|{name}"] = "error:" + type(error).__name__
+                put(f"{module}|{qual}|{name}", "error:" + type(error).__name__)
         # Inherited-from list matters when attributes are added or removed.
-        out[f"{module}|{qual}|__bases__"] = digest(*[
+        put(f"{module}|{qual}|__bases__", digest(*[
             f"{getattr(b, '__module__', '')}.{getattr(b, '__qualname__', '')}" for b in cls.__bases__
-        ])
+        ]))
 
     for modname in sorted(m for m in sys.modules if m.startswith("sqlglot")):
         module = sys.modules.get(modname)
@@ -272,6 +304,8 @@ def collect(fingerprinter: Fingerprinter) -> dict:
             module = sub.__dict__.get("__module__")
             if isinstance(module, str) and module.startswith("sqlglot") and id(sub) not in seen_classes:
                 visit_class(sub, module)
+    for key, fps in multi.items():
+        out[key] = digest("multi", *sorted(fps))
     return out
 
 
@@ -341,15 +375,39 @@ def import_everything(root: str, overrides: dict, deleted: set) -> list:
     return failed
 
 
+_BASELINES: dict = {}
+
+
+def load_baseline(path: str) -> dict:
+    """Pristine fingerprints, parsed once per process (a forked check
+    inherits them from the selector)."""
+    baseline = _BASELINES.get(path)
+    if baseline is None:
+        with gzip.open(path, "rt") as handle:
+            baseline = _BASELINES[path] = json.load(handle)
+    return baseline
+
+
+def warm(request: dict) -> None:
+    """Load what a check needs that does not depend on the patch (called in
+    the selector before forking a check)."""
+    if request.get("baseline"):
+        load_baseline(request["baseline"])
+
+
 def main() -> int:
     request = json.load(sys.stdin)
+    json.dump(run(request), sys.stdout)
+    return 0
+
+
+def run(request: dict) -> dict:
     overrides = request.get("overrides", {})
     deleted = set(request.get("deleted", []))
     try:
         failed = import_everything(request["root"], overrides, deleted)
     except BaseException as error:  # noqa: BLE001
-        json.dump({"ok": False, "error": f"{type(error).__name__}: {str(error)[:500]}"}, sys.stdout)
-        return 0
+        return {"ok": False, "error": f"{type(error).__name__}: {str(error)[:500]}"}
     fingerprinter = Fingerprinter()
     fps = collect(fingerprinter)
     callables = function_keys()
@@ -358,11 +416,9 @@ def main() -> int:
         # The baseline needs every table's entries; a comparison only the
         # changed ones (below).
         for key, value in TABLES.items():
-            ELEMENTS[key] = table_elements(fingerprinter, value)
-        json.dump({"ok": True, "fp": fps, "failed": failed, "elements": ELEMENTS}, sys.stdout)
-        return 0
-    with gzip.open(baseline_path, "rt") as handle:
-        baseline = json.load(handle)
+            ELEMENTS[key] = tables_elements(fingerprinter, value)
+        return {"ok": True, "fp": fps, "failed": failed, "elements": ELEMENTS}
+    baseline = load_baseline(baseline_path)
     base_fp = baseline["fp"]
     base_elements = baseline.get("elements", {})
     base_failed = {f[0] for f in baseline.get("failed", [])}
@@ -376,7 +432,7 @@ def main() -> int:
     value_only = []
     for k in changed:
         if k in TABLES:
-            ELEMENTS[k] = table_elements(fingerprinter, TABLES[k])
+            ELEMENTS[k] = tables_elements(fingerprinter, TABLES[k])
         old, new = base_elements.get(k), ELEMENTS.get(k)
         if old is None or new is None:
             continue
@@ -385,13 +441,9 @@ def main() -> int:
             # Same keys, different values: emptiness, length and membership
             # of the table are unchanged.
             value_only.append(k)
-    json.dump(
-        {"ok": True, "changed": changed, "added": added, "removed": removed, "failed": newly_failed,
-         "functions": sorted(k for k in changed + added if k in callables), "entries": entries,
-         "value_only": value_only},
-        sys.stdout,
-    )
-    return 0
+    return {"ok": True, "changed": changed, "added": added, "removed": removed, "failed": newly_failed,
+            "functions": sorted(k for k in changed + added if k in callables), "entries": entries,
+            "value_only": value_only}
 
 
 def function_keys() -> set:

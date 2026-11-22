@@ -56,6 +56,11 @@ def body():
 
 def main() -> int:
     request = json.load(sys.stdin)
+    json.dump(run(request), sys.stdout)
+    return 0
+
+
+def run(request: dict) -> dict:
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
     from fingerprint import _Finder  # noqa: E402
@@ -68,10 +73,8 @@ def main() -> int:
     try:
         body()
     except BaseException as error:  # noqa: BLE001
-        json.dump({"ok": True, "passed": False, "error": f"{type(error).__name__}: {error}"[:300]}, sys.stdout)
-        return 0
-    json.dump({"ok": True, "passed": True, "error": None}, sys.stdout)
-    return 0
+        return {"ok": True, "passed": False, "error": f"{type(error).__name__}: {error}"[:300]}
+    return {"ok": True, "passed": True, "error": None}
 
 
 if __name__ == "__main__":

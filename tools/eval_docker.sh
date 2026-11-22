@@ -14,6 +14,6 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$(to_win "$ROOT/$DATA_DIR"):/evaldata:ro" \
   -v "$(to_win "$ROOT/work"):/work" \
   -e BLAST_PRISTINE=/app/tree -e BLAST_VERIFY_TREE=/app/tree -e BLAST_FP_BASELINE=/app/fp_baseline.json.gz \
-  -e BLAST_VERBOSE=0 -e BLAST_TIME_BUDGET=1000000 \
+  -e BLAST_VERBOSE=0 -e BLAST_TIME_BUDGET=1000000 -e PYTHONHASHSEED=0 \
   -e BLAST_PROXY_MAX_NODES="${BLAST_PROXY_MAX_NODES:-1}" \
   "$IMAGE" python /repo/tools/eval.py --data /evaldata --maps /app/maps "$@"
