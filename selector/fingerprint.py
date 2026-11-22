@@ -90,7 +90,10 @@ class Fingerprinter:
     def value(self, v, depth: int = 0) -> str:
         t = type(v)
         if v is None or t in (bool, int, float, complex, str, bytes):
-            return digest(t.__name__, repr(v))
+            # Spelled out rather than hashed (most values are these; the
+            # enclosing digest hashes them anyway). Long ones are hashed.
+            text = repr(v)
+            return t.__name__ + ":" + text if len(text) <= 48 else digest(t.__name__, text)
         key = id(v)
         cached = self.memo.get(key)
         # The memo keeps each object alive: an id is only reused after its

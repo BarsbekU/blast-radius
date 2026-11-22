@@ -82,7 +82,7 @@ TPC_DATA_RERUN = os.environ.get("BLAST_TPC_DATA_RERUN", "1") == "1"
 # re-run a sample (the cheapest query exercising each changed data-phase
 # line, then the cheapest others) and drop the test if every one matches.
 TPC_SAMPLE = os.environ.get("BLAST_TPC_SAMPLE", "1") == "1"
-TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "2.5"))
+TPC_SAMPLE_SECS = float(os.environ.get("BLAST_TPC_SAMPLE_SECS", "1.5"))
 TPC_SAMPLE_MIN = int(os.environ.get("BLAST_TPC_SAMPLE_MIN", "8"))
 TPC_SAMPLE_MAX = int(os.environ.get("BLAST_TPC_SAMPLE_MAX", "16"))
 # 70/30 rule: changes not attributable to TPC queries (import-time values,
