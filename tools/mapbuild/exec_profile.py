@@ -102,6 +102,7 @@ def main() -> int:
         state["lines"][phase].setdefault(name[len(SRC):], set()).add(line)
         return mon.DISABLE
 
+
     def on_start(code, offset):
         # Same as the coverage tracer: a call records its def line (a body on
         # that line emits no LINE event).
@@ -136,7 +137,7 @@ def main() -> int:
             set_phase(previous)
 
     def w_optimize(*a, **k):
-        previous = set_phase("P")
+        previous = set_phase("Po")
         try:
             result = original_optimize(*a, **k)
             state["opt"] = h(serde.dump(result))
@@ -145,7 +146,7 @@ def main() -> int:
             set_phase(previous)
 
     def w_plan(*a, **k):
-        previous = set_phase("P")
+        previous = set_phase("Pg")
         try:
             plan = original_plan(*a, **k)
             state["plan"] = step_fingerprint(plan, serde)
@@ -154,7 +155,7 @@ def main() -> int:
             set_phase(previous)
 
     def w_generate(self, expression):
-        previous = set_phase("P")
+        previous = set_phase("Pg")
         try:
             if not expression:
                 return original_generate(self, expression)
@@ -189,9 +190,9 @@ def main() -> int:
         te.initializer(schema, tables)
         records = []
         for i, (meta, sql, optimized) in enumerate(sqls):
-            state.update(lines={"P": {}, "D": {}}, codegen=[], opt=None, plan=None)
+            state.update(lines={"Pp": {}, "Po": {}, "Pg": {}, "Pd": {}, "D": {}}, codegen=[], opt=None, plan=None)
             rec = {"i": i, "meta": meta, "sql": sql, "execute": bool(meta.get("execute"))}
-            set_phase("P")
+            set_phase("Pp")
             e1 = parse_one(sql)
             rec["parse"] = h(serde.dump(e1))
             e2 = pickle.loads(pickle.dumps(e1))
@@ -199,20 +200,30 @@ def main() -> int:
             if rec["execute"]:
                 rec["tables"] = sorted(t.name for t in find_tables(e2))
                 result = te.mp_execute(e2, meta)
+                set_phase("Pp")
                 rec["opt"], rec["plan"] = state["opt"], state["plan"]
                 rec["codegen_inputs"] = [[c[0], c[2]] for c in state["codegen"]]
                 rec["codegen"] = sorted(h([c[0], c[1]]) for c in state["codegen"])
                 rec["result"] = h([list(result.columns), [[repr(v) for v in row] for row in result.rows]])
+                set_phase("Pd")
                 rec["duck"] = h(transpile(sql, write="duckdb")[0])
             if with_optimized:
+                set_phase("Pd")
                 rec["optimized_sql"] = optimized
                 rec["duck_opt"] = h(transpile(optimized, write="duckdb")[0])
                 rec["duck"] = rec.get("duck") or h(transpile(sql, write="duckdb")[0])
             set_phase(None)
-            rec["P"] = {f: sorted(l) for f, l in state["lines"]["P"].items()}
+            stages = {"parse": "Pp", "opt": "Po", "plan": "Pg", "duck": "Pd"}
+            rec["S"] = {stage: {f: sorted(l) for f, l in state["lines"][phase].items()} for stage, phase in stages.items()}
+            union: dict = {}
+            for phase in stages.values():
+                for f, l in state["lines"][phase].items():
+                    union.setdefault(f, set()).update(l)
+            rec["P"] = {f: sorted(l) for f, l in union.items()}
             rec["D"] = {f: sorted(l) for f, l in state["lines"]["D"].items()}
             records.append(rec)
             print(f"query {i}: execute={rec['execute']} P={sum(map(len, rec['P'].values()))} "
+                  f"stages={ {k: sum(map(len, v.values())) for k, v in rec['S'].items()} } "
                   f"D={sum(map(len, rec['D'].values()))} codegen={len(state['codegen'])}", flush=True)
         return records
 

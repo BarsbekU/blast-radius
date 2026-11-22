@@ -147,14 +147,20 @@ def run(request: dict) -> dict:
 
     subquery_nodes = getattr(pyex, "SUBQUERY_NODES", None)
 
-    def same(rec, schema_dict) -> bool:
+    def same(rec, schema_dict, stages=None) -> bool:
+        """stages: the pipeline stages ("parse", "opt", "plan", "duck") that
+        run a changed line for this query, or None for all. A stage that
+        runs no changed line, given the same input, gives the same output:
+        it is not recomputed. Parsing is always redone (every stage depends
+        on it and it is cheap)."""
         e1 = parse_one(rec["sql"])
         if h(serde.dump(e1)) != rec["parse"]:
             return False
         e2 = pickle.loads(pickle.dumps(e1))
         if h(serde.dump(e2)) != rec["pickle"]:
             return False
-        if rec["execute"]:
+        later = stages is None or bool({"opt", "plan"} & set(stages))
+        if rec["execute"] and later:
             if sorted(t.name for t in find_tables(e2)) != rec["tables"]:
                 return False
             schema = ensure_schema(schema_dict, dialect=None)
@@ -194,7 +200,11 @@ def run(request: dict) -> dict:
                 produced.append(h([dump, captured[-1] if captured else None]))
             if sorted(produced) != rec["codegen"]:
                 return False
-        if "duck" in rec and h(transpile(rec["sql"], write="duckdb")[0]) != rec["duck"]:
+        if rec["execute"] and not later and sorted(t.name for t in find_tables(e2)) != rec["tables"]:
+            return False
+        if (stages is None or "duck" in stages) and "duck" in rec and (
+            h(transpile(rec["sql"], write="duckdb")[0]) != rec["duck"]
+        ):
             return False
         return True
 
@@ -255,9 +265,10 @@ def run(request: dict) -> dict:
                 if probe(first[0]):
                     continue
             pipe_changed, truncated, probed = [], False, False
+            stage_map = (request.get("stages") or {}).get(test) or {}
             for i in qs:
                 try:
-                    if not same(records[i], schema_dict):
+                    if not same(records[i], schema_dict, stage_map.get(str(i))):
                         pipe_changed.append(i)
                 except BaseException:  # noqa: BLE001 - an error is a change
                     pipe_changed.append(i)

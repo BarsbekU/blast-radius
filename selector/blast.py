@@ -203,8 +203,8 @@ def _forked(fn, request: dict, timeout: float, env: dict) -> dict:
 # need nothing beyond sqlglot and pytz. BLAST_UNIT_CHECK=0 disables it.
 UNIT_CHECK = os.environ.get("BLAST_UNIT_CHECK", "1") == "1"
 UNIT_SCRIPT = HERE / "unit_check.py"
-UNIT_MAX_TESTS = 4
-UNIT_MAX_MS = 1000
+UNIT_MAX_TESTS = int(os.environ.get("BLAST_UNIT_MAX_TESTS", "4"))
+UNIT_MAX_MS = int(os.environ.get("BLAST_UNIT_MAX_MS", "1000"))
 UNIT_EXCLUDED_FILES = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_sqlglotc.py"}
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -485,6 +485,7 @@ class Maps:
             for test, records in raw.items():
                 queries = []
                 queries_d = []
+                queries_s = []
                 union_p: dict = {}
                 union_d: dict = {}
                 for rec in records:
@@ -496,7 +497,10 @@ class Maps:
                         union_d.setdefault(f, set()).update(l)
                     queries.append(p)
                     queries_d.append(d)
-                out[test] = {"queries": queries, "queries_d": queries_d, "P": union_p, "D": union_d}
+                    # Pipeline lines per stage (parse, opt, plan, duck), when profiled.
+                    queries_s.append({st: {f: set(l) for f, l in files.items()} for st, files in rec.get("S", {}).items()})
+                out[test] = {"queries": queries, "queries_d": queries_d, "queries_s": queries_s,
+                             "P": union_p, "D": union_d}
             self._exec_lines = out
         return self._exec_lines
 
@@ -1930,7 +1934,7 @@ class Selector:
 
         costs_path = self.maps.root / "exec_costs.json"
         costs_all = json.loads(costs_path.read_text()) if costs_path.exists() else {}
-        queries, data_queries, must = {}, {}, {}
+        queries, data_queries, must, stages = {}, {}, {}, {}
         for key, n in targets.items():
             run = run_lines(n)
             if not run and not unattributed:
@@ -1982,6 +1986,20 @@ class Selector:
                         first.append(min(runs, key=lambda i: (costs.get(i, 99.0), i)))
             if ok and (affected or affected_d):
                 queries[key] = sorted(affected - affected_d)
+                # Which pipeline stages each affected query runs changed lines
+                # in: the check recomputes only those (and what feeds them).
+                per_query = {}
+                for i in queries[key]:
+                    staged = info.get("queries_s", [])
+                    stage_lines = staged[i] if i < len(staged) else {}
+                    if not stage_lines:
+                        continue  # not profiled per stage: compare everything
+                    per_query[str(i)] = sorted(
+                        st for st, files in stage_lines.items()
+                        if any(mine & files.get(rel, set()) for rel, mine in run.items())
+                    )
+                if per_query:
+                    stages[key] = per_query
                 if affected_d:
                     data_queries[key] = sorted(affected_d)
                     must[key] = sorted(set(first))
@@ -2009,6 +2027,7 @@ class Selector:
             "data_queries": data_queries,
             "optimized_tpch": opt_ok,
             "unattributed": unattributed,
+            "stages": {} if unattributed else stages,
         }
         data_zip = self.maps.root / "data.zip"
         rerun_ok = RERUN and bool(queries) and data_zip.exists() and costs_all

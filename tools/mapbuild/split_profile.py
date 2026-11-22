@@ -38,7 +38,10 @@ def main(src: str, out_dir: str) -> int:
         lines[test] = []
         compact[test] = []
         for rec in profile[test]:
-            lines[test].append({"P": rec.pop("P"), "D": rec.pop("D")})
+            entry = {"P": rec.pop("P"), "D": rec.pop("D")}
+            if "S" in rec:
+                entry["S"] = rec.pop("S")
+            lines[test].append(entry)
             if "codegen_inputs" in rec:
                 rec["codegen_inputs"] = [[ref(a), ref(b)] for a, b in rec["codegen_inputs"]]
             compact[test].append(rec)
