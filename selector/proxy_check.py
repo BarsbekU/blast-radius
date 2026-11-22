@@ -64,6 +64,7 @@ def main() -> int:
     overrides, deleted = request.get("overrides", {}), set(request.get("deleted", []))
     if overrides or deleted:
         sys.meta_path.insert(0, _Finder(overrides, deleted))
+    import unittest  # noqa: F401  (sqlglot's test-mode argument checks)
     try:
         body()
     except BaseException as error:  # noqa: BLE001

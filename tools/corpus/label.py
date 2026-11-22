@@ -194,6 +194,10 @@ def main() -> int:
                 for n in by_file.get(nodeid, []):
                     failing.add(n)
             result["exitstatus"] = data["exitstatus"]
+            if data["exitstatus"] in (3, 4):
+                # Internal or usage error (e.g. a named test whose file no
+                # longer imports): pytest ran nothing, so this is no label.
+                status = "usage_error"
         elif status == "ok":
             status = "no_report"
         result.update(status=status, failing=sorted(failing), secs=round(secs, 1), pruned=pruned)

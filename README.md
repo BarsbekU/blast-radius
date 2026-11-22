@@ -38,6 +38,14 @@ and `python -c` subprocesses the tests start. For each test it records:
    that run stay selected. A change confined to a lambda body selects only
    that lambda's callers. Statements with no bytecode (or dead code) fall
    back to the tests that reach the neighbouring statements.
+   Function code that also runs while sqlglot's modules load (metaclasses,
+   `__init_subclass__`, helpers called from class bodies) is split: a
+   second trace (`BLAST_TRACE_RUNTIME=1`) records which tests run each line
+   outside module loading (`maps/rtcov.json.gz`; test modules and the
+   classes they define count as run time). Those tests are selected, and
+   what the line did during imports is decided by the fingerprint diff
+   below, so a metaclass edit no longer selects every test that imports a
+   dialect.
 3. Comment, whitespace and docstring edits change nothing a test can
    observe (nothing in sqlglot reads docstrings); a file that no longer
    compiles breaks every test that imports it.
@@ -54,7 +62,9 @@ and `python -c` subprocesses the tests start. For each test it records:
    which did not change, and is not selected.
 5. Fixtures and other data files select the tests that read them; pytest
    config files select everything only if pytest's settings change or the
-   file stops parsing.
+   file stops parsing. Tests selected by edits under `tests/` stay selected
+   whatever the checks below decide, and such edits no longer switch those
+   checks off for the sqlglot changes in the same commit.
 6. A function definition that only moved within a module or class body
    (identical code, name bound once, no order-sensitive decorators) is not
    a change; the fingerprint diff still checks the module/class values.
@@ -71,13 +81,20 @@ and `python -c` subprocesses the tests start. For each test it records:
    dropped only if every sampled result matches. Changes the line-level
    analysis cannot attribute to particular queries (import-time values,
    broad selections, lines outside the profiled queries) are decided the
-   same way with every query a candidate: all parse-only queries are
-   checked, a sample is executed, and `test_optimized_tpch` gets the exact
-   duckdb-SQL comparison (executor-package changes stay conservative,
-   since the tests' class setup loads data through it). Re-runs stop at the
-   first difference. This is the one place the selector trades certainty
-   for time: a change whose effect shows only in unsampled queries would be
-   missed.
+   same way with every query a candidate: every query's pipeline outputs
+   (parse, pickle, optimizer, plan, generated code, duckdb SQL) are
+   compared, the queries whose outputs differ are all executed (the test
+   is kept if more than 8 differ), a sample of the rest is executed, and
+   `test_optimized_tpch` gets the exact duckdb-SQL comparison
+   (executor-package changes stay conservative, since the tests' class
+   setup loads data through it). Re-runs stop at the first difference.
+   This is the one place the selector trades certainty for time: a change
+   whose effect shows only in the executed results of unsampled queries
+   would be missed.
+   All check subprocesses import `unittest` before sqlglot: sqlglot turns
+   on strict argument checks (`UNITTEST`) when unittest or pytest is
+   loaded, as in every test run, and a check without them can pass a
+   change the tests reject.
 8. `test_max_nodes` (29 s) is replaced
    by the same assertions on a 300-wide instead of 10,000-wide statement
    (`selector/proxy_check.py`) when the patch only edits sqlglot modules.

@@ -83,6 +83,9 @@ def main() -> int:
     overrides, deleted = request.get("overrides", {}), set(request.get("deleted", []))
     if overrides or deleted:
         sys.meta_path.insert(0, _Finder(overrides, deleted))
+    # sqlglot turns on strict argument checks (UNITTEST) when unittest or
+    # pytest is loaded, as it is in every test run: match that.
+    import unittest  # noqa: F401
     try:
         from sqlglot import find_tables, parse_one, serde, transpile
         from sqlglot.executor import python as pyex
@@ -244,7 +247,19 @@ def main() -> int:
                 changed[test] = still
             elif sample:
                 executed = {i for i, rec in enumerate(records) if rec.get("execute")}
-                pick = sample_queries(need, costs, cfg, executed)
+                # Queries whose pipeline output differs are the likely ones to
+                # change the result: all of them are re-run, or the test kept.
+                extra = [i for i in pipe_changed if i not in cfg.get("must", [])]
+                too_many = truncated or len(extra) > PIPE_RERUN_MAX or (
+                    sum(costs.get(i, 99.0) for i in extra) > cfg.get("max_secs", 8.0))
+                if too_many and request.get("unattributed"):
+                    # Whole-package changes with many differing pipelines:
+                    # keep the test rather than trust a sample.
+                    changed[test] = sorted(pipe_changed)
+                    rerun_note[test] = {"tried": [], "still": sorted(pipe_changed)[:5], "mode": "pipeline"}
+                    continue
+                extra = sorted(extra, key=lambda i: (costs.get(i, 99.0), i))[:PIPE_RERUN_MAX]
+                pick = sample_queries(need, costs, dict(cfg, must=list(cfg.get("must", [])) + extra), executed)
                 still = rerun_queries(dict(cfg, extra_seeds=[]), records, pick, schema_dict, transpile, h)
                 rerun_note[test] = {"tried": pick, "still": still, "mode": "sample",
                                     "of": f"{len(need)}{'+' if truncated else ''}"}
@@ -309,6 +324,9 @@ def run_one(sql, schema_dict, zf, prefix, cache):
         tables[name] = cache[name]
     result = execute(expression, schema=schema_dict, tables=tables)
     return h([list(result.columns), [[repr(v) for v in row] for row in result.rows]])
+
+
+PIPE_RERUN_MAX = 8  # pipeline-changed queries re-run before giving up and keeping the test
 
 
 def sample_queries(need, costs, cfg, executed=None) -> list:
@@ -410,6 +428,7 @@ def rerun_only(request) -> int:
     sys.path.insert(0, request["root"])
     if request.get("overrides") or request.get("deleted"):
         sys.meta_path.insert(0, _Finder(request.get("overrides", {}), set(request.get("deleted", []))))
+    import unittest  # noqa: F401  (sqlglot's test-mode checks, as in main)
     bad = []
     with zipfile.ZipFile(request["data"]) as zf:
         cache: dict = {}

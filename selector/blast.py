@@ -100,6 +100,12 @@ VALUE_ONLY_TABLES = os.environ.get("BLAST_VALUE_ONLY_TABLES", "1") == "1"
 PROXY_MAX_NODES = os.environ.get("BLAST_PROXY_MAX_NODES", "1") == "1"
 PROXY_SCRIPT = HERE / "proxy_check.py"
 MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
+
+# Function lines that some test runs only while modules import (metaclasses,
+# __init_subclass__, helpers called from class bodies): take their run-time
+# testers (maps/rtcov.json.gz) and leave the import-time effects to the
+# fingerprint. BLAST_RT_SPLIT=0 turns it off.
+RT_SPLIT = os.environ.get("BLAST_RT_SPLIT", "1") == "1"
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "0"))  # 0: derive from batch size
@@ -179,6 +185,34 @@ class Shard:
                     out |= self.bits(index)
         return out
 
+    rt: dict = {}
+    rt_sets: list = []
+
+    def rt_bits(self, index: int) -> int:
+        key = ("rt", index)
+        value = self.cache.get(key)
+        if value is None:
+            value = self.cache[key] = decode(self.rt_sets[index])
+        return value
+
+    def import_hit(self, lines) -> bool:
+        rt = self.rt
+        return bool(rt) and any(line in rt for line in lines)
+
+    def runtime_executors(self, lines) -> int:
+        """Like executors(lines, ("f",)), counting only runs outside imports
+        for lines that also run while modules import."""
+        out = 0
+        for line in lines:
+            k = self.rt.get(line)
+            if k is not None:
+                out |= self.rt_bits(k)
+            else:
+                index = self.f.get(str(line))
+                if index is not None:
+                    out |= self.bits(index)
+        return out
+
     def executable(self, lines, kinds) -> bool:
         for kind in kinds:
             table = self.xf if kind == "f" else self.xd
@@ -214,12 +248,29 @@ class Maps:
         self.src = zipfile.ZipFile(root / "src.zip")
         self.src_names = set(self.src.namelist())
 
+    _rtcov = None
+
+    @property
+    def rtcov(self) -> dict:
+        if self._rtcov is None:
+            path = self.root / "rtcov.json.gz"
+            self._rtcov = {"sets": [], "files": {}}
+            if RT_SPLIT and path.exists():
+                with gzip.open(path, "rt") as handle:
+                    self._rtcov = json.load(handle)
+        return self._rtcov
+
     def shard(self, rel: str) -> Shard | None:
         if rel not in self.shards:
             path = self.root / "cov" / (rel.replace("/", "__") + ".json.gz")
             if path.exists():
                 with gzip.open(path, "rb") as handle:
-                    self.shards[rel] = Shard(json.loads(handle.read()))
+                    shard = Shard(json.loads(handle.read()))
+                rt = self.rtcov["files"].get(rel)
+                if rt:
+                    shard.rt = {int(line): k for line, k in rt.items()}
+                    shard.rt_sets = self.rtcov["sets"]
+                self.shards[rel] = shard
             else:
                 self.shards[rel] = None
         return self.shards[rel]
@@ -408,11 +459,14 @@ class Maps:
         for rel, lines in table.items():
             shard = self.shard(rel)
             if shard is not None:
-                bits |= shard.executors(lines, ("f",))
+                # Reads made while modules import show up in the fingerprint.
+                bits |= shard.runtime_executors(lines)
         return bits
 
-    def same_name_tests(self, name: str, only_file: str | None = None) -> int:
-        """Tests that called any function or method called `name`."""
+    def same_name_tests(self, name: str, only_file: str | None = None, runtime: bool = False) -> int:
+        """Tests that called any function or method called `name` (with
+        runtime=True: outside imports, for use after a fingerprint diff,
+        which already shows what import-time calls produced)."""
         bits = 0
         for rel, spans in self.funcs.get(name, {}).items():
             if only_file is not None and rel != only_file:
@@ -421,7 +475,8 @@ class Maps:
             if shard is None:
                 continue
             for start, end in spans:
-                bits |= shard.executors(range(start, end + 1), ("f",))
+                lines = range(start, end + 1)
+                bits |= shard.runtime_executors(lines) if runtime else shard.executors(lines, ("f",))
         return bits
 
     def class_users(self, module: str, qual: str) -> int:
@@ -961,13 +1016,39 @@ class Differ:
     def lines_tests(self, lines, kinds) -> int:
         lines = list(lines)
         self.touched.update(lines)
+        return self.split_tests(lines, kinds)
+
+    def split_tests(self, lines, kinds) -> int:
+        """Testers of these lines. A function line that some test runs only
+        while modules import counts its run-time testers; what it did during
+        imports shows up in the fingerprint diff (full coverage stays the
+        fallback when the fingerprint cannot run)."""
+        if "f" in kinds and RT_SPLIT and self.use_fp and self.shard.import_hit(lines):
+            full = self.shard.executors(lines, kinds)
+            bits = self.shard.runtime_executors(lines)
+            other = [k for k in kinds if k != "f"]
+            if other:
+                bits |= self.shard.executors(lines, other)
+            if bin(bits).count("1") > 0.9 * bin(full).count("1"):
+                # Nearly every tester runs it at run time anyway: plain
+                # coverage, no fingerprint run needed for this.
+                return full
+            self.need_fp = True
+            self.fallback |= full
+            if not getattr(self, "rt_noted", False):
+                self.rt_noted = True
+                self.reasons.append(
+                    f"run-time split L{lines[0]}: {bin(bits).count('1')} of {bin(full).count('1')} tests "
+                    "run it outside imports; import-time effects -> fingerprint"
+                )
+            return bits
         return self.shard.executors(lines, kinds)
 
     def scope_tests(self, scope: Scope) -> int:
         """Every test that can reach code in this scope."""
         self.broad = True
         if scope.kind == "f" and scope.node is not None:
-            return self.shard.executors(span(scope.node), ("f",))
+            return self.split_tests(span(scope.node), ("f",))
         return self.shard.importers
 
     def point_tests(self, block, before: int, after: int, scope: Scope, why: str) -> int:
@@ -1666,7 +1747,7 @@ class Selector:
                 shard = self.maps.shard(rel)
                 if shard is None:
                     continue
-                mine = {ln for ln in touched if shard.executors([ln], ("f",)) >> n & 1}
+                mine = {ln for ln in touched if shard.runtime_executors([ln]) >> n & 1}
                 if mine:
                     out[rel] = mine
             return out
@@ -1676,7 +1757,9 @@ class Selector:
         queries, data_queries, must = {}, {}, {}
         for key, n in targets.items():
             run = run_lines(n)
-            if not run:
+            if not run and not unattributed:
+                # (Import-time value changes show no run-time lines; they
+                # are decided by the whole-package re-run below.)
                 continue
             info = lines[key]
             # Data-phase lines are only handled by re-running queries (tpcds,
@@ -1688,7 +1771,10 @@ class Selector:
             if unattributed:
                 if key == "tpcds" and not data_ok:
                     continue
-                queries[key] = []
+                # Every query's pipeline (parse ... codegen, duckdb SQL) is
+                # compared; the ones that differ are re-run for real, and a
+                # sample of the rest is executed.
+                queries[key] = list(range(len(info["queries"])))
                 data_queries[key] = list(range(len(info["queries"])))
                 must[key] = []
                 continue
@@ -1746,6 +1832,7 @@ class Selector:
             "queries": queries,
             "data_queries": data_queries,
             "optimized_tpch": opt_ok,
+            "unattributed": unattributed,
         }
         data_zip = self.maps.root / "data.zip"
         rerun_ok = RERUN and bool(queries) and data_zip.exists() and costs_all
@@ -1927,17 +2014,17 @@ class Selector:
             elif not added:
                 # Never read as data at run time: a method whose defaults or
                 # decorators changed (or an unused constant): its callers.
-                bits |= self.maps.same_name_tests(name, only_file=rel)
+                bits |= self.maps.same_name_tests(name, only_file=rel, runtime=True)
             if added:
                 # A new attribute or method may shadow one inherited from a
                 # parent, for the tests that use this class at all.
                 users = self.maps.class_users(module, qual)
-                inherited = self.maps.attr_readers_named(name) | self.maps.same_name_tests(name)
+                inherited = self.maps.attr_readers_named(name) | self.maps.same_name_tests(name, runtime=True)
                 bits |= (inherited & users) if users else inherited
             return bits
         # Module global: functions that read it (own module or importers), and
         # functions of that name in the same module.
-        return self.maps.ref_tests(name, module) | self.maps.same_name_tests(name, only_file=rel)
+        return self.maps.ref_tests(name, module) | self.maps.same_name_tests(name, only_file=rel, runtime=True)
 
     def broad(self, fp: FilePatch) -> int:
         bits = 0

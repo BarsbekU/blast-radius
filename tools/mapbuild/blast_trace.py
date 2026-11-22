@@ -36,8 +36,40 @@ def _install(out_dir: str) -> None:
 
     executed: dict = {}
 
+    # BLAST_TRACE_RUNTIME=1: record only lines run outside imports (module
+    # loading, including lazy imports during a test, is left to the import-time
+    # fingerprint). Import-time hits keep the event enabled, so a later
+    # run-time execution of the same line is still seen.
+    runtime_only = os.environ.get("BLAST_TRACE_RUNTIME") == "1"
+    # Import depth per thread (a pool's manager thread may run sqlglot code
+    # while the main thread imports).
+    depths: dict = {}
+    import threading
+
+    get_ident = threading.get_ident
+    if runtime_only:
+        import importlib._bootstrap as _bs
+
+        _orig_load_unlocked = _bs._load_unlocked
+
+        def _load_unlocked(spec):
+            # Only sqlglot's own modules: the fingerprint imports exactly
+            # those. Test modules (and the classes they define) count as run
+            # time.
+            mine = spec.name == "sqlglot" or spec.name.startswith("sqlglot.")
+            ident = get_ident()
+            depths[ident] = depths.get(ident, 0) + mine
+            try:
+                return _orig_load_unlocked(spec)
+            finally:
+                depths[ident] -= mine
+
+        _bs._load_unlocked = _load_unlocked
+
     def on_line(code, line):
         if code.co_filename.startswith(root):
+            if depths and depths.get(get_ident()):
+                return None
             seen = executed.get(code)
             if seen is None:
                 seen = executed[code] = set()
@@ -51,6 +83,8 @@ def _install(out_dir: str) -> None:
         # LINE event at all: its only instructions are on the line where it
         # starts. Record the start line so such calls are not invisible.
         if code.co_filename.startswith(root):
+            if depths and depths.get(get_ident()):
+                return None
             seen = executed.get(code)
             if seen is None:
                 seen = executed[code] = set()

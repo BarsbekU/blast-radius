@@ -324,6 +324,7 @@ def import_everything(root: str, overrides: dict, deleted: set) -> list:
     if overrides or deleted:
         sys.meta_path.insert(0, _Finder(overrides, deleted))
     failed = []
+    import unittest  # noqa: F401  (sqlglot's test-mode argument checks, as in test runs)
     import sqlglot  # noqa: F401  (a failure here is reported by the caller)
 
     names = set()

@@ -480,6 +480,317 @@ def whitespace_edit(source: str, rng: random.Random):
     return "".join(lines[:k] + ["\n"] + lines[k:]), f"insert blank line {k + 1}"
 
 
+
+# --------------------------------------------------------------------------- final-style kinds
+# Kinds the practice batch may not show: control-flow edits, error paths,
+# decorators, class structure, and behaviour-preserving refactors (where a
+# selector over-selects rather than misses).
+
+
+def _ast(source):
+    import ast
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
+def _indent_of(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def early_return(source: str, rng: random.Random):
+    """Insert `return None` before a function's first statement."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    cands = []
+    for f in _funcs(tree):
+        if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(f)):
+            continue
+        body = f.body
+        k = 1 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) else 0
+        if k < len(body):
+            cands.append((f, body[k]))
+    if not cands:
+        return None
+    f, first = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    line = lines[first.lineno - 1]
+    indent = _indent_of(line)
+    if len(indent) != first.col_offset:
+        return None
+    new = lines[: first.lineno - 1] + [indent + "return None\n"] + lines[first.lineno - 1:]
+    return "".join(new), f"early return in {f.name} at line {first.lineno}"
+
+
+def raise_to_pass(source: str, rng: random.Random):
+    """Replace a one-line `raise ...` with `pass` (an error path stops raising)."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    cands = [n for n in ast.walk(tree) if isinstance(n, ast.Raise) and n.lineno == n.end_lineno]
+    if not cands:
+        return None
+    n = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    line = lines[n.lineno - 1]
+    indent = _indent_of(line)
+    if len(indent) != n.col_offset or not line.strip().startswith("raise"):
+        return None
+    lines[n.lineno - 1] = indent + "pass\n"
+    return "".join(lines), f"raise -> pass at line {n.lineno}"
+
+
+def message_edit(source: str, rng: random.Random):
+    """Change the text of an error, warning or log message."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    cands = []
+    for n in ast.walk(tree):
+        call = None
+        if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call):
+            call = n.exc
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in (
+            "warning", "warn", "error", "info", "debug", "exception", "raise_error", "unsupported"
+        ):
+            call = n
+        if call is None:
+            continue
+        for a in call.args[:1]:
+            if isinstance(a, (ast.Constant, ast.JoinedStr)) and a.lineno == a.end_lineno and (
+                not isinstance(a, ast.Constant) or (isinstance(a.value, str) and len(a.value) > 3)
+            ):
+                cands.append(a)
+    if not cands:
+        return None
+    a = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    raw = lines[a.lineno - 1].encode("utf-8")
+    seg = raw[a.col_offset:a.end_col_offset].decode("utf-8")
+    qs = [i for i in (seg.find('"'), seg.find("'")) if i >= 0]
+    if not qs:
+        return None
+    q = min(qs)
+    new_seg = seg[: q + 1] + rng.choice(["Error: ", "Unable to proceed: ", "Note - "]) + seg[q + 1:]
+    lines[a.lineno - 1] = (raw[: a.col_offset] + new_seg.encode("utf-8") + raw[a.end_col_offset:]).decode("utf-8")
+    return "".join(lines), f"message text at line {a.lineno}"
+
+
+def remove_decorator(source: str, rng: random.Random):
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    cands = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            cands.extend(d for d in n.decorator_list if d.lineno == d.end_lineno)
+    if not cands:
+        return None
+    d = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    if not lines[d.lineno - 1].strip().startswith("@"):
+        return None
+    what = lines[d.lineno - 1].strip()[:40]
+    new = lines[: d.lineno - 1] + lines[d.lineno:]
+    return "".join(new), f"remove decorator at line {d.lineno}: {what}"
+
+
+def local_rename(source: str, rng: random.Random):
+    """Behaviour-preserving: rename one local variable throughout its function."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    funcs = _funcs(tree)
+    rng.shuffle(funcs)
+    for f in funcs:
+        if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("locals", "vars", "eval", "exec")
+               for n in ast.walk(f)):
+            continue
+        params = set()
+        for g in [f] + [n for n in ast.walk(f) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]:
+            a = g.args
+            params |= {x.arg for x in a.args + a.kwonlyargs + a.posonlyargs}
+            params |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
+        declared = {name for n in ast.walk(f) if isinstance(n, (ast.Global, ast.Nonlocal)) for name in n.names}
+        stores = {n.id for n in ast.walk(f) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        cand = sorted(v for v in stores - params - declared if len(v) > 1)
+        if not cand:
+            continue
+        v = rng.choice(cand)
+        new_name = v + "_val"
+        if new_name in source:
+            continue
+        nodes = [n for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == v]
+        if any(n.lineno != n.end_lineno for n in nodes):
+            continue
+        lines = source.splitlines(keepends=True)
+        by_line = {}
+        for n in nodes:
+            by_line.setdefault(n.lineno, []).append(n)
+        ok = True
+        for row, ns in by_line.items():
+            raw = lines[row - 1].encode("utf-8")
+            for n in sorted(ns, key=lambda n: -n.col_offset):
+                if raw[n.col_offset:n.end_col_offset] != v.encode():
+                    ok = False
+                    break
+                raw = raw[: n.col_offset] + new_name.encode() + raw[n.end_col_offset:]
+            lines[row - 1] = raw.decode("utf-8")
+        if ok and len(by_line) >= 2:
+            return "".join(lines), f"rename local {v} -> {new_name} in {f.name}"
+    return None
+
+
+def wrap_parens(source: str, rng: random.Random):
+    """Behaviour-preserving (AST-identical): parenthesize a returned value."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    lines = source.splitlines(keepends=True)
+    cands = [n for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value is not None
+             and n.lineno == n.end_lineno and "#" not in lines[n.lineno - 1]]
+    if not cands:
+        return None
+    n = rng.choice(cands)
+    raw = lines[n.lineno - 1].encode("utf-8")
+    v = n.value
+    raw = raw[: v.col_offset] + b"(" + raw[v.col_offset:v.end_col_offset] + b")" + raw[v.end_col_offset:]
+    lines[n.lineno - 1] = raw.decode("utf-8")
+    return "".join(lines), f"parenthesize return at line {n.lineno}"
+
+
+def flag_flip(source: str, rng: random.Random):
+    """Flip a boolean class or module setting (`NAME = True`)."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    cands = []
+    for holder in [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        for st in holder.body:
+            if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Constant) \
+                    and isinstance(st.value.value, bool) and st.lineno == st.end_lineno:
+                cands.append(st)
+    if not cands:
+        return None
+    st = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    raw = lines[st.lineno - 1].encode("utf-8")
+    v = st.value
+    flipped = b"False" if v.value else b"True"
+    lines[st.lineno - 1] = (raw[: v.col_offset] + flipped + raw[v.end_col_offset:]).decode("utf-8")
+    return "".join(lines), f"flip setting at line {st.lineno}"
+
+
+def remove_base(source: str, rng: random.Random):
+    """Drop the last base class of a class with two or more bases."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    lines = source.splitlines(keepends=True)
+    cands = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and len(n.bases) >= 2
+             and n.bases[-1].lineno == n.bases[-2].lineno == n.lineno]
+    if not cands:
+        return None
+    n = rng.choice(cands)
+    raw = lines[n.lineno - 1].encode("utf-8")
+    a, b = n.bases[-2], n.bases[-1]
+    raw = raw[: a.end_col_offset] + raw[b.end_col_offset:]
+    lines[n.lineno - 1] = raw.decode("utf-8")
+    return "".join(lines), f"remove base of {n.name}"
+
+
+def move_function(source: str, rng: random.Random):
+    """Move a top-level function below the next top-level definition."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    body = tree.body
+    cands = []
+    for i, st in enumerate(body[:-1]):
+        nxt = body[i + 1]
+        if isinstance(st, ast.FunctionDef) and isinstance(nxt, (ast.FunctionDef, ast.ClassDef)):
+            cands.append((st, nxt))
+    if not cands:
+        return None
+    f, g = rng.choice(cands)
+    lines = source.splitlines(keepends=True)
+    start = min([f.lineno] + [d.lineno for d in f.decorator_list]) - 1
+    gstart = min([g.lineno] + [d.lineno for d in g.decorator_list]) - 1
+    block_f = lines[start:gstart]
+    block_g = lines[gstart:g.end_lineno]
+    new = lines[:start] + block_g + ["\n", "\n"] + block_f + lines[g.end_lineno:]
+    return "".join(new), f"move {f.name} below {g.name}"
+
+
+def annotation_edit(source: str, rng: random.Random):
+    """Change a return annotation (no effect under postponed annotations)."""
+    import ast
+    tree = _ast(source)
+    if tree is None or "import typing as t" not in source:
+        return None
+    lines = source.splitlines(keepends=True)
+    cands = [f for f in _funcs(tree) if f.returns is not None and f.returns.lineno == f.returns.end_lineno]
+    if not cands:
+        return None
+    f = rng.choice(cands)
+    r = f.returns
+    raw = lines[r.lineno - 1].encode("utf-8")
+    if raw[r.col_offset:r.end_col_offset] == b"t.Any":
+        return None
+    lines[r.lineno - 1] = (raw[: r.col_offset] + b"t.Any" + raw[r.end_col_offset:]).decode("utf-8")
+    return "".join(lines), f"annotation of {f.name}"
+
+
+def swap_args(source: str, rng: random.Random):
+    """Swap the two positional arguments of a one-line call."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    lines = source.splitlines(keepends=True)
+    cands = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and len(n.args) == 2 and not n.keywords
+             and n.args[0].lineno == n.args[1].end_lineno == n.lineno
+             and not any(isinstance(a, ast.Starred) for a in n.args)]
+    if not cands:
+        return None
+    n = rng.choice(cands)
+    raw = lines[n.lineno - 1].encode("utf-8")
+    a, b = n.args
+    ta, tb = raw[a.col_offset:a.end_col_offset], raw[b.col_offset:b.end_col_offset]
+    if ta == tb:
+        return None
+    raw = raw[: a.col_offset] + tb + raw[a.end_col_offset:b.col_offset] + ta + raw[b.end_col_offset:]
+    lines[n.lineno - 1] = raw.decode("utf-8")
+    return "".join(lines), f"swap call arguments at line {n.lineno}"
+
+
+def add_test(source: str, rng: random.Random):
+    """Add a new (passing) test method to a test class."""
+    import ast
+    tree = _ast(source)
+    if tree is None:
+        return None
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name.startswith("Test")]
+    if not classes:
+        return None
+    c = rng.choice(classes)
+    lines = source.splitlines(keepends=True)
+    end = c.end_lineno
+    method = ["\n", "    def test_added_by_patch(self):\n", "        self.assertEqual(1 + 1, 2)\n"]
+    new = lines[:end] + method + lines[end:]
+    return "".join(new), f"add test to {c.name}"
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--src", type=Path, required=True)
@@ -488,6 +799,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--prefix", default="m")
     parser.add_argument("--kinds", default="", help="comma separated kinds to draw from (default: the usual mix)")
+    parser.add_argument("--plan", default="", help="'final': the final-style mix (sample kinds plus many others)")
     args = parser.parse_args()
     rng = random.Random(args.seed)
 
@@ -622,6 +934,30 @@ def main() -> int:
             k = rng.randrange(len(lines) + 1)
             ins = "# note\n" if not rel.endswith(".md") else "Note.\n"
             return [(rel, ("".join(lines[:k] + [ins] + lines[k:]), f"insert line {k + 1}"))]
+        simple = {
+            "earlyreturn": early_return, "raisepass": raise_to_pass, "message": message_edit,
+            "decorator": remove_decorator, "localrename": local_rename, "parens": wrap_parens,
+            "flagflip": flag_flip, "removebase": remove_base, "movefunc": move_function,
+            "annotation": annotation_edit, "swapargs": swap_args,
+        }
+        if kind in simple:
+            rel = pick_py()
+            r = simple[kind](read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "testadd":
+            rel = rng.choice(test_files)
+            r = add_test(read(rel), rng)
+            return [(rel, r)] if r else None
+        if kind == "multi2":
+            # a code edit plus a behaviour-preserving edit elsewhere
+            parts, used = [], set()
+            for sub in (rng.choice(["code", "earlyreturn", "message", "flagflip"]),
+                        rng.choice(["localrename", "parens", "comment", "fixture"])):
+                edit = one(sub)
+                if edit and edit[0][0] not in used:
+                    used.add(edit[0][0])
+                    parts.extend(edit)
+            return parts if len(parts) >= 2 else None
         raise ValueError(kind)
 
     kinds_plan = (
@@ -629,6 +965,16 @@ def main() -> int:
         + ["test"] * 5 + ["docstring"] * 3 + ["delete"] * 2 + ["duplicate"] * 1
         + ["swapline"] * 1 + ["docs"] * 1 + ["config"] * 1
     )
+    if args.plan == "final":
+        kinds_plan = (
+            ["code"] * 30 + ["fixture"] * 10 + ["comment"] * 8 + ["multi"] * 6 + ["multi2"] * 4 + ["test"] * 4
+            + ["docstring"] * 2 + ["delete"] * 2 + ["swapline"] + ["duplicate"] + ["docs"] + ["config"]
+            + ["earlyreturn"] * 3 + ["raisepass"] * 3 + ["message"] * 3 + ["decorator"] * 3 + ["localrename"] * 4
+            + ["parens"] * 2 + ["flagflip"] * 3 + ["removebase"] * 2 + ["movefunc"] * 3 + ["annotation"] * 2
+            + ["swapargs"] * 3 + ["testadd"] * 2 + ["stmtdel"] * 2 + ["nameerr"] * 2 + ["default"] * 2
+            + ["addfunc"] + ["addimport"] + ["swapmethods"] * 2 + ["whitespace"] + ["rename"] + ["newmodule"]
+            + ["delmodule"] + ["nonpy"] + ["testhelper"] + ["table"] * 3
+        )
     if args.kinds:
         kinds_plan = args.kinds.split(",")
     (args.out / "commits").mkdir(parents=True, exist_ok=True)
