@@ -33,6 +33,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import json
+import os
 import pkgutil
 import re
 import sys
@@ -386,8 +387,15 @@ def load_baseline(path: str) -> dict:
     inherits them from the selector)."""
     baseline = _BASELINES.get(path)
     if baseline is None:
-        with gzip.open(path, "rt") as handle:
-            baseline = _BASELINES[path] = json.load(handle)
+        pkl = path[: -len(".json.gz")] + ".pkl" if path.endswith(".json.gz") else None
+        if pkl and os.path.exists(pkl):
+            import pickle
+
+            with open(pkl, "rb") as handle:  # written at image build from the same JSON
+                baseline = _BASELINES[path] = pickle.load(handle)
+        else:
+            with gzip.open(path, "rt") as handle:
+                baseline = _BASELINES[path] = json.load(handle)
     return baseline
 
 

@@ -211,7 +211,7 @@ UNIT_CHECK = os.environ.get("BLAST_UNIT_CHECK", "1") == "1"
 UNIT_SCRIPT = HERE / "unit_check.py"
 UNIT_MAX_TESTS = int(os.environ.get("BLAST_UNIT_MAX_TESTS", "16"))
 UNIT_MAX_MS = int(os.environ.get("BLAST_UNIT_MAX_MS", "300"))
-UNIT_EXCLUDED_FILES = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_sqlglotc.py"}
+UNIT_EXCLUDED_FILES = {"tests/test_executor.py", "tests/test_sqlglotc.py"}
 WORKER_MS = 2000
 MAX_WORKERS = 8
 TIME_BUDGET = float(os.environ.get("BLAST_TIME_BUDGET", "0"))  # 0: derive from batch size
@@ -261,6 +261,23 @@ def decode(enc) -> int:
     for n in enc:
         bits |= 1 << n
     return bits
+
+
+
+def load_json_gz(path) -> object:
+    """A map file's parsed JSON. The image build also stores each one as a
+    pickle beside it (x.json.gz -> x.pkl): same data, several times faster
+    to load, so that is used when present."""
+    path = Path(path)
+    if path.name.endswith(".json.gz"):
+        pkl = path.with_name(path.name[: -len(".json.gz")] + ".pkl")
+        if pkl.exists():
+            import pickle
+
+            with open(pkl, "rb") as handle:
+                return pickle.load(handle)
+    with gzip.open(path, "rb") as handle:
+        return json.loads(handle.read())
 
 
 class Shard:
@@ -340,17 +357,14 @@ class Maps:
     def __init__(self, root: Path):
         self.root = root
         self.shards: dict = {}
-        with gzip.open(root / "files.json.gz", "rt") as handle:
-            files = json.load(handle)
+        files = load_json_gz(root / "files.json.gz")
         self.data_reads = files["data"]
         self.cache_reads = files["linecache"]
-        with gzip.open(root / "dirs.json.gz", "rt") as handle:
-            self.dirs = json.load(handle)
+        self.dirs = load_json_gz(root / "dirs.json.gz")
         imports_path = root / "imports.json.gz"
         self.imports: dict = {}
         if imports_path.exists():
-            with gzip.open(imports_path, "rt") as handle:
-                self.imports = json.load(handle)
+            self.imports = load_json_gz(imports_path)
         self.src = zipfile.ZipFile(root / "src.zip")
         self.src_names = set(self.src.namelist())
 
@@ -362,16 +376,14 @@ class Maps:
             path = self.root / "rtcov.json.gz"
             self._rtcov = {"sets": [], "files": {}}
             if RT_SPLIT and path.exists():
-                with gzip.open(path, "rt") as handle:
-                    self._rtcov = json.load(handle)
+                self._rtcov = load_json_gz(path)
         return self._rtcov
 
     def shard(self, rel: str) -> Shard | None:
         if rel not in self.shards:
             path = self.root / "cov" / (rel.replace("/", "__") + ".json.gz")
             if path.exists():
-                with gzip.open(path, "rb") as handle:
-                    shard = Shard(json.loads(handle.read()))
+                shard = Shard(load_json_gz(path))
                 rt = self.rtcov["files"].get(rel)
                 if rt:
                     shard.rt = {int(line): k for line, k in rt.items()}
@@ -413,8 +425,7 @@ class Maps:
         path = self.root / name
         if not path.exists():
             return {}
-        with gzip.open(path, "rt") as handle:
-            return json.load(handle)
+        return load_json_gz(path)
 
     @property
     def attrs(self) -> dict:
@@ -469,8 +480,7 @@ class Maps:
             self._akeys_seen = {}
             path = self.root / "akeys_seen.json.gz"
             if path.exists():
-                with gzip.open(path, "rt") as handle:
-                    raw = json.load(handle)
+                raw = load_json_gz(path)
                 sets = [int(s, 16) for s in raw["sets"]]
                 self._akeys_seen = {tag: sets[i] for tag, i in raw["tables"].items()}
         return self._akeys_seen
@@ -518,8 +528,7 @@ class Maps:
             self._cmp = None
             path = self.root / "cmp.json.gz"
             if CMP_REFINE and path.exists():
-                with gzip.open(path, "rt") as handle:
-                    raw = json.load(handle)
+                raw = load_json_gz(path)
                 traced = 0
                 for n in raw["traced"]:
                     traced |= 1 << n

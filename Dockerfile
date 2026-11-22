@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir pytz==2026.6 \
     && echo '{"root": "/app/tree"}' \
        | PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python -P -s /app/fingerprint.py 2>/dev/null \
        | python -c "import gzip, json, sys; d = json.load(sys.stdin); assert d['ok'] and not d['failed'], d.get('error'); gzip.open('/app/fp_baseline.json.gz', 'wt').write(json.dumps(d))" \
+    && python -c "import glob, gzip, json, pickle; [pickle.dump(json.load(gzip.open(f, 'rt')), open(f[:-8] + '.pkl', 'wb'), protocol=5) for f in glob.glob('/app/maps/*.json.gz') + glob.glob('/app/maps/cov/*.json.gz') + ['/app/fp_baseline.json.gz']]" \
     && chmod -R a+rX /app
 
 ENV BLAST_PRISTINE=/app/tree

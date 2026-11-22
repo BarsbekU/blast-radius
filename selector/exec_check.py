@@ -79,8 +79,13 @@ def load_profile(path: str) -> dict:
     check inherits it from the selector)."""
     profile = _PROFILES.get(path)
     if profile is None:
-        with gzip.open(path, "rt") as handle:
-            profile = _PROFILES[path] = json.load(handle)
+        pkl = path[: -len(".json.gz")] + ".pkl" if path.endswith(".json.gz") else None
+        if pkl and os.path.exists(pkl):
+            with open(pkl, "rb") as handle:  # written at image build from the same JSON
+                profile = _PROFILES[path] = pickle.load(handle)
+        else:
+            with gzip.open(path, "rt") as handle:
+                profile = _PROFILES[path] = json.load(handle)
     return profile
 
 

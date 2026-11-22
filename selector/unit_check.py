@@ -17,6 +17,85 @@ import os
 import sys
 
 
+def _stub_optimizer_test_deps() -> None:
+    """tests/test_optimizer.py imports duckdb and pandas and runs fixture
+    cases on a process pool. Here duckdb accepts only the statements its
+    setUpClass runs (any other use raises, so a test that needs duckdb
+    errors and is kept), pandas' frame comparison raises, and the pool runs
+    each case in-process with the same pickle round trip for its result."""
+    import concurrent.futures
+    import pickle
+    import types
+
+    class _Unavailable(RuntimeError):
+        pass
+
+    def _in_setup() -> bool:
+        frame = sys._getframe(2)
+        while frame is not None:
+            if frame.f_code.co_name == "setUpClass":
+                return True
+            frame = frame.f_back
+        return False
+
+    class _Conn:
+        def execute(self, *args, **kwargs):
+            if not _in_setup():
+                raise _Unavailable("duckdb is not available in the selector")
+            return self
+
+        def __enter__(self):
+            raise _Unavailable("duckdb is not available in the selector")
+
+        def __exit__(self, *args):
+            return False
+
+        def close(self):
+            pass
+
+        def __getattr__(self, name):
+            raise _Unavailable("duckdb is not available in the selector")
+
+    duckdb = types.ModuleType("duckdb")
+    duckdb.connect = lambda *a, **k: _Conn()
+    sys.modules.setdefault("duckdb", duckdb)
+
+    def _no_frames(*args, **kwargs):
+        raise _Unavailable("pandas is not available in the selector")
+
+    pandas = types.ModuleType("pandas")
+    testing = types.ModuleType("pandas.testing")
+    testing.assert_frame_equal = _no_frames
+    pandas.testing = testing
+    pandas.DataFrame = _no_frames
+    sys.modules.setdefault("pandas", pandas)
+    sys.modules.setdefault("pandas.testing", testing)
+
+    class _InProcessPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def submit(self, fn, *args, **kwargs):
+            future = concurrent.futures.Future()
+            try:
+                args, kwargs = pickle.loads(pickle.dumps((args, kwargs)))
+                future.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+            except BaseException as error:  # noqa: BLE001
+                future.set_exception(error)
+            return future
+
+        def shutdown(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    concurrent.futures.ProcessPoolExecutor = _InProcessPool
+
+
 def _name(node_id: str) -> str:
     path, cls, method = node_id.split("::")
     return f"{path[:-3].replace('/', '.')}.{cls}.{method}"
@@ -34,6 +113,7 @@ def run(request: dict) -> dict:
         sys.meta_path.insert(0, _Finder(overrides, deleted))
     os.environ["SKIP_INTEGRATION"] = "0"
     os.chdir(root)
+    _stub_optimizer_test_deps()
     import unittest
 
     node_ids = list(request["tests"])
