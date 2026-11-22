@@ -147,10 +147,16 @@ def _forked(fn, request: dict, timeout: float, env: dict) -> dict:
 
     sys.stdout.flush()
     sys.stderr.flush()
+    # The selector's own objects (maps, caches) go to the permanent
+    # generation: the check's garbage collections then never scan them.
+    import gc
+
+    gc.freeze()
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:  # the check: never returns
         status = 0
+        pass  # automatic collection stays off in the check (fingerprint collects explicitly)
         try:
             os.close(r)
             devnull = os.open(os.devnull, os.O_RDWR)
@@ -2451,6 +2457,12 @@ def pack(numbers: list, ms: dict) -> list:
 
 def main() -> int:
     global BUDGET
+    # A short-lived process holding large maps: automatic cyclic garbage
+    # collection would only rescan them (checks run in forked children,
+    # which collect their own garbage).
+    import gc
+
+    gc.disable()
     tests = json.loads((DATA / "tests.json").read_text("utf-8"))["tests"]
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     valid_numbers = set(ms)
