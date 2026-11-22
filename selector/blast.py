@@ -1558,10 +1558,17 @@ class Selector:
         self.fp_entries = {}
         self.fp_value_only = set()
         bits = 0
+        # Tests selected by files under tests/ (fixtures, test modules): the
+        # TPC re-run and proxies judge only sqlglot code, so these stay
+        # selected whatever those checks find.
+        pinned = 0
         for fp in patches:
             try:
                 self.record_change(fp)
-                bits |= self.file(fp, reasons)
+                got = self.file(fp, reasons)
+                bits |= got
+                if is_test_side(fp):
+                    pinned |= got
             except Exception as error:  # never lose a commit to a bug here
                 reasons.append(f"{fp.path}: analysis failed ({error!r}); broad fallback")
                 bits |= self.broad(fp)
@@ -1580,7 +1587,7 @@ class Selector:
             bits = self.verify_heavy(bits, self.ms, reasons)
         except Exception as error:
             reasons.append(f"verify failed ({error!r}); keeping all")
-        return bits
+        return bits | pinned
 
     def proxy_refine(self, bits: int, reasons: list) -> int:
         """Opt-in: replace test_max_nodes by a scaled-down run of its body
@@ -1951,7 +1958,7 @@ class Selector:
         if not (
             rel.startswith("sqlglot/") and rel.endswith(".py") and old_rel == new_rel
             and not fp.is_new and not fp.is_deleted and not fp.binary
-        ):
+        ) and not is_test_side(fp):
             self.exec_ok = False  # only in-place edits of sqlglot modules qualify
 
         # pytest config candidates at the repository root
@@ -2111,12 +2118,26 @@ class Selector:
             self.pending["fallback"] |= differ.fallback
         if rel.startswith("sqlglot/"):
             self.exec_info.append((rel, differ.touched, differ.broad or bool(readers)))
-        else:
+        elif not is_test_side(fp):
             self.exec_ok = False
         return differ.tests | readers
 
 
 # --------------------------------------------------------------------------- packing
+
+
+def is_test_side(fp) -> bool:
+    """A change confined to tests/ that cannot alter how sqlglot itself or
+    pytest's setup behaves: edited in place, not a conftest or package
+    __init__, not a pytest config file."""
+    paths = {fp.old_path, fp.new_path} - {None}
+    if not paths or fp.old_path != fp.new_path or fp.is_new or fp.is_deleted:
+        return False
+    for path in paths:
+        name = posixpath.basename(path)
+        if not path.startswith("tests/") or name in ("conftest.py", "__init__.py") or name in PYTEST_CONFIG_FILES:
+            return False
+    return True
 
 
 def pack(numbers: list, ms: dict) -> list:
